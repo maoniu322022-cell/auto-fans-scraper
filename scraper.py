@@ -82,24 +82,56 @@ class PeopleSearchScraper:
             "people in" in html.lower()
         )
     
-    def _is_verification_page(self, html: str) -> bool:
-        """检查是否是验证页面"""
-        if self._has_search_results(html):
+    def _is_cloudflare_page(self, page) -> bool:
+        """检查是否是 Cloudflare 验证页面"""
+        try:
+            content = page.content()
+            return "Cloudflare" in content and "challenges.cloudflare" in content
+        except:
             return False
-        
-        verification_keywords = [
-            "Performing security verification",
-            "Incompatible browser",
-            "security verification",
-            "challenges.cloudflare"
-        ]
-        
-        html_lower = html.lower()
-        for keyword in verification_keywords:
-            if keyword.lower() in html_lower:
+    
+    def _handle_cloudflare(self, page) -> bool:
+        """处理 Cloudflare 验证"""
+        try:
+            logger.info("⏳ 检测到 Cloudflare 验证页面")
+            
+            # 等待验证框加载
+            try:
+                page.wait_for_selector('input[type="checkbox"]', timeout=5000)
+                logger.info("✓ 找到验证框")
+            except:
+                logger.warning("⚠️ 未找到验证框，等待自动验证...")
+                time.sleep(3)
                 return True
-        
-        return len(html) < 3000
+            
+            # 尝试点击验证复选框
+            try:
+                checkbox = page.query_selector('input[type="checkbox"]')
+                if checkbox:
+                    logger.info("✓ 点击验证复选框...")
+                    checkbox.click()
+                    time.sleep(3)
+            except Exception as e:
+                logger.debug(f"点击复选框失败: {e}")
+            
+            # 等待验证完成
+            logger.info("⏳ 等待验证完成...")
+            time.sleep(5)
+            
+            # 检查验证是否完成
+            content = page.content()
+            if "Approximate Age" in content or "people in" in content.lower():
+                logger.info("✓ Cloudflare 验证已完成")
+                return True
+            else:
+                logger.warning("⚠️ 验证可能未完成，请手动完成验证")
+                logger.info("按任何键继续...")
+                input()
+                return True
+                
+        except Exception as e:
+            logger.debug(f"处理 Cloudflare 失败: {e}")
+            return False
     
     def search_by_name(self, name: str) -> List[Dict]:
         """按名字搜索"""
@@ -110,11 +142,11 @@ class PeopleSearchScraper:
             logger.info(f"正在搜索: {name}")
             logger.info(f"访问 URL: {search_url}")
             
-            # 尝试用 cloudscraper
+            # 优先使用 cloudscraper
             if self.scraper:
                 logger.info("使用 cloudscraper 请求...")
                 html = self._fetch_with_cloudscraper(search_url)
-                if html and not self._is_verification_page(html):
+                if html and self._has_search_results(html):
                     logger.info("✓ 获取到搜索结果")
                     results = self._extract_results_from_html(html, name)
                     if results:
@@ -128,15 +160,12 @@ class PeopleSearchScraper:
             self.page.goto(search_url, wait_until="networkidle")
             time.sleep(config.WAIT_TIME)
             
-            page_html = self.page.content()
-            if self._is_verification_page(page_html):
-                logger.warning("⚠️ 需要手动完成验证")
-                logger.info("按任何键继续...")
-                input()
+            # 处理 Cloudflare 验证
+            if self._is_cloudflare_page(self.page):
+                self._handle_cloudflare(self.page)
                 time.sleep(2)
-                page_html = self.page.content()
             
-            # 从 DOM 提取详细结果
+            # 从 DOM 提取结果
             results = self._extract_results_from_dom(name)
             
             return results
@@ -164,7 +193,7 @@ class PeopleSearchScraper:
             return []
         
         # 查找符合年龄范围的人物
-        pattern = r'([A-Z][a-z]+ [A-Z][a-z]+).*?Approximate Age[:\s]+(\d+)'
+        pattern = r'([A-Z][a-z]+ [A-Z][a-z]+).*?Approximate Age[:=\s]+(\d+)'
         matches = re.findall(pattern, html, re.IGNORECASE)
         
         for name, age_str in matches:
@@ -216,7 +245,7 @@ class PeopleSearchScraper:
                             continue
                     
                     # 提取年龄
-                    age_match = re.search(r'Approximate Age[:\s]+(\d+)', card_text, re.IGNORECASE)
+                    age_match = re.search(r'Approximate Age[:=\s]+(\d+)', card_text, re.IGNORECASE)
                     if not age_match:
                         continue
                     
@@ -227,7 +256,7 @@ class PeopleSearchScraper:
                     logger.info(f"✓ 找到: {person_name} (年龄: {age})")
                     
                     # 提取位置
-                    location_match = re.search(r'Current Location[:\s]+([^\n]+)', card_text, re.IGNORECASE)
+                    location_match = re.search(r'Current Location[:=\s]+([^\n]+)', card_text, re.IGNORECASE)
                     location = location_match.group(1).strip() if location_match else "Unknown"
                     
                     # 查找详情按钮
@@ -270,6 +299,12 @@ class PeopleSearchScraper:
             
             detail_page = new_page_info.value
             time.sleep(config.WAIT_TIME)
+            
+            # 处理详情页的 Cloudflare
+            if self._is_cloudflare_page(detail_page):
+                logger.info("⚠️ 详情页需要 Cloudflare 验证")
+                self._handle_cloudflare(detail_page)
+                time.sleep(2)
             
             # 等待电话元素
             try:
@@ -325,7 +360,7 @@ class PeopleSearchScraper:
     def _extract_location(self, html: str, name: str) -> str:
         """提取位置"""
         try:
-            pattern = f"{name}.*?Current Location[:\\s]+([^<\\n]+)"
+            pattern = f"{name}.*?Current Location[:=\\s]+([^<\\n]+)"
             match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
             if match:
                 return re.sub(r'<[^>]+>', '', match.group(1)).strip()
