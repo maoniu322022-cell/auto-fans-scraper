@@ -43,12 +43,13 @@ class PeopleSearchScraper:
                 headless=config.HEADLESS,
                 args=[
                     '--disable-blink-features=AutomationControlled',
-                    '--disable-dev-shm-usage'
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox'
                 ]
             )
             
             self.context = self.browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             )
             
             self.page = self.context.new_page()
@@ -82,55 +83,80 @@ class PeopleSearchScraper:
             "people in" in html.lower()
         )
     
-    def _is_cloudflare_page(self, page) -> bool:
-        """检查是否是 Cloudflare 验证页面"""
+    def _is_cloudflare_challenge(self, page) -> bool:
+        """检查是否是 Cloudflare 挑战页面"""
         try:
             content = page.content()
-            return "Cloudflare" in content and "challenges.cloudflare" in content
+            return (
+                "Cloudflare" in content and 
+                ("challenge" in content.lower() or 
+                 "security check" in content.lower() or
+                 "正在进行安全验证" in content)
+            )
         except:
             return False
     
-    def _handle_cloudflare(self, page) -> bool:
-        """处理 Cloudflare 验证"""
+    def _handle_cloudflare_challenge(self, page) -> bool:
+        """处理 Cloudflare 挑战"""
         try:
-            logger.info("⏳ 检测到 Cloudflare 验证页面")
+            logger.info("⏳ 检测到 Cloudflare 挑战页面，等待处理...")
             
-            # 等待验证框加载
+            # 方法1: 等待 Cloudflare 自动处理
+            logger.info("正在等待 Cloudflare 自动处理 (30秒)...")
             try:
-                page.wait_for_selector('input[type="checkbox"]', timeout=5000)
-                logger.info("✓ 找到验证框")
-            except:
-                logger.warning("⚠️ 未找到验证框，等待自动验证...")
-                time.sleep(3)
+                page.wait_for_navigation(timeout=30000, wait_until="networkidle")
+                logger.info("✓ 自动处理完成")
                 return True
+            except:
+                pass
             
-            # 尝试点击验证复选框
-            try:
-                checkbox = page.query_selector('input[type="checkbox"]')
-                if checkbox:
-                    logger.info("✓ 点击验证复选框...")
-                    checkbox.click()
-                    time.sleep(3)
-            except Exception as e:
-                logger.debug(f"点击复选框失败: {e}")
+            # 方法2: 查找并点击验证复选框
+            logger.info("尝试点击验证框...")
+            
+            # 尝试多个选择器
+            selectors = [
+                'input[type="checkbox"]',
+                'label input[type="checkbox"]',
+                '[aria-label*="checkbox"]',
+                '.cf-checkbox',
+                '#challenge-form input'
+            ]
+            
+            for selector in selectors:
+                try:
+                    elements = page.query_selector_all(selector)
+                    if elements:
+                        logger.info(f"找到元素: {selector}")
+                        for elem in elements:
+                            try:
+                                # 滚动到元素
+                                elem.scroll_into_view_if_needed()
+                                time.sleep(0.5)
+                                # 点击
+                                elem.click()
+                                logger.info("✓ 已点击验证框")
+                                time.sleep(2)
+                                break
+                            except Exception as e:
+                                logger.debug(f"点击失败: {e}")
+                except:
+                    pass
             
             # 等待验证完成
-            logger.info("⏳ 等待验证完成...")
-            time.sleep(5)
+            logger.info("⏳ 等待验证完成 (15秒)...")
+            time.sleep(15)
             
-            # 检查验证是否完成
-            content = page.content()
-            if "Approximate Age" in content or "people in" in content.lower():
-                logger.info("✓ Cloudflare 验证已完成")
-                return True
-            else:
-                logger.warning("⚠️ 验证可能未完成，请手动完成验证")
-                logger.info("按任何键继续...")
+            # 检查是否仍在验证页面
+            if self._is_cloudflare_challenge(page):
+                logger.warning("⚠️ 验证可能未完成，请手动完成验证后按任何键继续...")
                 input()
-                return True
+            else:
+                logger.info("✓ Cloudflare 验证已完成")
+            
+            return True
                 
         except Exception as e:
-            logger.debug(f"处理 Cloudflare 失败: {e}")
+            logger.error(f"处理 Cloudflare 失败: {e}")
             return False
     
     def search_by_name(self, name: str) -> List[Dict]:
@@ -157,13 +183,25 @@ class PeopleSearchScraper:
             if not self.page:
                 self.init_browser()
             
-            self.page.goto(search_url, wait_until="networkidle")
-            time.sleep(config.WAIT_TIME)
+            # 访问页面
+            self.page.goto(search_url, wait_until="domcontentloaded")
+            time.sleep(2)
             
-            # 处理 Cloudflare 验证
-            if self._is_cloudflare_page(self.page):
-                self._handle_cloudflare(self.page)
+            # 处理 Cloudflare 挑战
+            if self._is_cloudflare_challenge(self.page):
+                self._handle_cloudflare_challenge(self.page)
                 time.sleep(2)
+            
+            # 等待搜索结果加载
+            try:
+                self.page.wait_for_selector(
+                    'div:has-text("Approximate Age"), div:has-text("Current Location")',
+                    timeout=10000
+                )
+            except:
+                logger.debug("未找到结果选择器，继续处理...")
+            
+            time.sleep(config.WAIT_TIME)
             
             # 从 DOM 提取结果
             results = self._extract_results_from_dom(name)
@@ -301,9 +339,9 @@ class PeopleSearchScraper:
             time.sleep(config.WAIT_TIME)
             
             # 处理详情页的 Cloudflare
-            if self._is_cloudflare_page(detail_page):
+            if self._is_cloudflare_challenge(detail_page):
                 logger.info("⚠️ 详情页需要 Cloudflare 验证")
-                self._handle_cloudflare(detail_page)
+                self._handle_cloudflare_challenge(detail_page)
                 time.sleep(2)
             
             # 等待电话元素
