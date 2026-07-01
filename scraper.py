@@ -251,78 +251,92 @@ class PeopleSearchScraper:
         return results
     
     def _extract_results_from_dom(self, search_name: str) -> List[Dict]:
-        """从 DOM 提取结果并获取电话"""
+        """从 DOM 提取结果 - 保存所有符合条件的人员"""
         results = []
         
         try:
-            logger.info("开始从 DOM 提取结果...")
+            logger.info("开始从页面提取所有符合条件的人员...")
             
-            # 查找所有结果卡片
-            result_cards = self.page.query_selector_all("div")
+            # 获取页面内容
+            page_content = self.page.content()
             
-            for card in result_cards:
-                try:
-                    card_text = card.inner_text()
-                    
-                    if "Approximate Age" not in card_text:
-                        continue
-                    
-                    # 提取名字
-                    name_elem = card.query_selector("h3, .name, [class*='name']")
-                    if name_elem:
-                        person_name = name_elem.inner_text().strip()
-                    else:
-                        lines = card_text.split('\n')
-                        person_name = None
-                        for line in lines:
-                            line = line.strip()
-                            if line and len(line) > 3 and re.match(r'^[A-Z][a-z]+ [A-Z]', line):
-                                person_name = line
-                                break
-                        if not person_name:
-                            continue
-                    
-                    # 提取年龄
-                    age_match = re.search(r'Approximate Age[:=\s]+(\d+)', card_text, re.IGNORECASE)
-                    if not age_match:
-                        continue
-                    
+            # 提取所有人员信息
+            # 寻找包含 "Approximate Age" 的文本块
+            age_pattern = r'([A-Z][a-z]+ [A-Z][a-z]+).*?Approximate Age[:=\s]*(\d+)'
+            location_pattern = r'Current Location[:=\s]*([^\n<]+)'
+            
+            # 获取所有文本内容
+            page_text = self.page.evaluate('document.body.innerText')
+            
+            # 查找所有符合条件的人员
+            lines = page_text.split('\n')
+            current_person = None
+            
+            for i, line in enumerate(lines):
+                line = line.strip()
+                
+                # 检查是否是年龄信息
+                age_match = re.search(r'Approximate Age[:=\s]*(\d+)', line, re.IGNORECASE)
+                if age_match:
                     age = int(age_match.group(1))
+                    
+                    # 检查年龄范围
                     if not (config.MIN_AGE <= age <= config.MAX_AGE):
+                        current_person = None
                         continue
                     
-                    logger.info(f"✓ 找到: {person_name} (年龄: {age})")
+                    # 回溯找名字
+                    person_name = None
+                    for j in range(i - 1, max(0, i - 5), -1):
+                        prev_line = lines[j].strip()
+                        if prev_line and re.match(r'^[A-Z][a-z]+ [A-Z][a-z]+', prev_line):
+                            person_name = prev_line
+                            break
                     
-                    # 提取位置
-                    location_match = re.search(r'Current Location[:=\s]+([^\n]+)', card_text, re.IGNORECASE)
-                    location = location_match.group(1).strip() if location_match else "Unknown"
+                    if not person_name:
+                        person_name = "Unknown"
                     
-                    # 查找详情按钮
-                    button = card.query_selector("button:has-text('View All Info'), a:has-text('View All Info'), button, a")
-                    if not button:
-                        continue
+                    # 查找位置信息
+                    location = "Unknown"
+                    for j in range(i + 1, min(len(lines), i + 5)):
+                        next_line = lines[j].strip()
+                        if "Current Location" in next_line:
+                            loc_match = re.search(r'Current Location[:=\s]*([^\n]+)', next_line, re.IGNORECASE)
+                            if loc_match:
+                                location = loc_match.group(1).strip()
+                            break
                     
-                    # 点击按钮获取电话
-                    phones = self._get_phones_from_detail_page(button)
+                    # 查找电话信息
+                    phone = "未获取"
+                    if config.ONLY_WIRELESS:
+                        for j in range(i + 1, min(len(lines), i + 10)):
+                            next_line = lines[j].strip()
+                            if "Wireless" in next_line or "Mobile" in next_line:
+                                phone_match = re.search(r'\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}', next_line)
+                                if phone_match:
+                                    phone = phone_match.group(0).strip()
+                                    break
                     
-                    if phones:
-                        for phone in phones:
-                            results.append({
-                                "name": person_name,
-                                "age": age,
-                                "location": location,
-                                "phone": phone
-                            })
-                            logger.info(f"✓ 保存: {person_name} - {phone}")
+                    # 保存结果
+                    result = {
+                        "name": person_name,
+                        "age": age,
+                        "location": location,
+                        "phone": phone
+                    }
                     
-                except Exception as e:
-                    logger.debug(f"处理卡片失败: {e}")
-                    continue
+                    # 避免重复
+                    if result not in results:
+                        results.append(result)
+                        logger.info(f"✓ 保存: {person_name} | 年龄: {age} | 位置: {location} | 电话: {phone}")
             
+            logger.info(f"✓ 共从页面提取 {len(results)} 条符合条件的记录")
             return results
             
         except Exception as e:
             logger.error(f"提取结果失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return []
     
     def _get_phones_from_detail_page(self, button) -> List[str]:
