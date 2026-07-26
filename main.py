@@ -1,6 +1,7 @@
 import logging
 import sys
 import os
+import time
 from pathlib import Path
 from scraper import PeopleSearchScraper
 import config
@@ -45,47 +46,57 @@ def load_names(filename: str) -> list:
 
 def main():
     """主程序"""
+    run_start = time.monotonic()
+
     logger.info("=" * 60)
     logger.info("开始按名字搜索")
     logger.info("=" * 60)
-    
+
     # 加载名字
     names = load_names(config.INPUT_FILE)
     if not names:
         logger.error("未加载到名字，退出")
         return
-    
+
     logger.info(f"✓ 筛选条件: 年龄 {config.MIN_AGE}-{config.MAX_AGE} 岁")
     if config.ONLY_WIRELESS:
         logger.info("✓ 仅保留 Wireless 电话")
+    logger.info(f"✓ CF_MODE={config.CF_MODE}  MAX_RETRIES={config.MAX_RETRIES}")
     logger.info("")
-    
+
     # 初始化爬虫
     scraper = PeopleSearchScraper()
     all_results = []
-    
+
+    # 统计计数器
+    success_count = 0
+    fail_count = 0
+
     try:
         for idx, name in enumerate(names, 1):
             logger.info(f"[进度 {idx}/{len(names)}] 正在处理: {name}")
-            
+
             try:
                 results = scraper.search_by_name(name)
-                
+
                 if results:
                     all_results.extend(results)
+                    success_count += 1
                     logger.info(f"[✓] 找到 {len(results)} 条记录")
                 else:
+                    success_count += 1  # 请求本身未报错
                     logger.info(f"[✗] 无符合条件的结果")
-                
+
             except Exception as e:
+                fail_count += 1
                 logger.error(f"处理 {name} 时出错: {e}")
                 continue
-            
+
             logger.info("")
-    
+
     finally:
         scraper.close()
-    
+
     # 保存结果
     logger.info("=" * 60)
     if all_results:
@@ -93,6 +104,16 @@ def main():
         scraper.save_results(all_results, config.OUTPUT_FILE)
     else:
         logger.info("未找到符合条件的结果")
+
+    # 运行摘要
+    elapsed = time.monotonic() - run_start
+    logger.info("=" * 60)
+    logger.info("── 运行摘要 ──────────────────────────────────")
+    logger.info(f"  总名字数 : {len(names)}")
+    logger.info(f"  成功处理 : {success_count}")
+    logger.info(f"  失败数   : {fail_count}")
+    logger.info(f"  结果记录 : {len(all_results)}")
+    logger.info(f"  总耗时   : {elapsed:.1f}s")
     logger.info("=" * 60)
 
 
