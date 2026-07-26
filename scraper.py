@@ -1,600 +1,565 @@
+# -*- coding: utf-8 -*-
+import csv
 import logging
 import random
 import re
 import time
-import csv
-from typing import List, Dict, Optional
 from pathlib import Path
-from urllib.parse import urljoin
-from playwright.sync_api import sync_playwright
+from typing import Dict, List, Optional, Set, Tuple
 
-try:
-    import cloudscraper
-    CLOUDSCRAPER_AVAILABLE = True
-except ImportError:
-    CLOUDSCRAPER_AVAILABLE = False
+import cloudscraper
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 import config
 
-logger = logging.getLogger(__name__)
-
-DEDUP_FIELDS = ("name", "age", "location", "phone")
-PHONE_PATTERN = re.compile(r"(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}")
-
-
-def _dedup_key(record: Dict) -> tuple:
-    return tuple(str(record.get(f, "")).strip() for f in DEDUP_FIELDS)
-
-
-def _normalize_phone(raw: str) -> str:
-    digits = re.sub(r"\D", "", raw or "")
-    if len(digits) == 11 and digits.startswith("1"):
-        digits = digits[1:]
-    if len(digits) == 10:
-        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
-    return (raw or "").strip()
-
-
-def retry_with_backoff(func, *, max_retries: int = None, base_delay: float = None, label: str = "operation"):
-    if max_retries is None:
-        max_retries = config.MAX_RETRIES
-    if base_delay is None:
-        base_delay = config.RETRY_BASE_DELAY
-
-    for attempt in range(max_retries + 1):
-        try:
-            return func()
-        except Exception as exc:
-            if attempt >= max_retries:
-                logger.error(f"[{label}] all {max_retries} retries failed: {exc}")
-                raise
-            delay = base_delay * (2 ** attempt) + random.uniform(0, base_delay)
-            logger.warning(f"[{label}] retry {attempt + 1}/{max_retries} after {delay:.1f}s, error: {exc}")
-            time.sleep(delay)
+logger = logging.getLogger("scraper")
 
 
 class PeopleSearchScraper:
     def __init__(self):
+        self.base_url = config.BASE_URL.rstrip("/")
+        self.search_url = config.SEARCH_URL
+        self.timeout = getattr(config, "TIMEOUT", 30000)
+        self.wait_time = getattr(config, "WAIT_TIME", 1.0)
+        self.max_retries = getattr(config, "MAX_RETRIES", 2)
+        self.retry_base_delay = getattr(config, "RETRY_BASE_DELAY", 1.2)
+
+        self.min_age = getattr(config, "MIN_AGE", 55)
+        self.max_age = getattr(config, "MAX_AGE", 75)
+        self.only_wireless = getattr(config, "ONLY_WIRELESS", False)
+
+        self.cf_mode = getattr(config, "CF_MODE", "skip")  # skip/manual/retry
+        self.cf_manual_max_wait = getattr(config, "CF_MANUAL_MAX_WAIT", 1200)
+
+        self.max_candidates = getattr(config, "MAX_CANDIDATES_PER_QUERY", 30)
+        self.max_pages = getattr(config, "MAX_PAGES", 0)  # 0 = unlimited
+
         self.browser = None
-        self.page = None
-        self.playwright = None
         self.context = None
-        self.scraper = None
+        self.page = None
 
-        if CLOUDSCRAPER_AVAILABLE:
-            try:
-                self.scraper = cloudscraper.create_scraper()
-                logger.info("✓ cloudscraper initialized")
-            except Exception as e:
-                logger.warning(f"cloudscraper init failed: {e}")
-
-    def init_browser(self):
-        self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(
-            headless=config.HEADLESS,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-            ],
-        )
+    # -----------------------
+    # Browser lifecycle
+    # -----------------------
+    def start(self):
+        self._pw = sync_playwright().start()
+        self.browser = self._pw.chromium.launch(headless=getattr(config, "HEADLESS", False))
         self.context = self.browser.new_context(
+            viewport={"width": 1366, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
         )
         self.page = self.context.new_page()
-        self.page.set_default_timeout(config.TIMEOUT)
-        logger.info("✓ browser started")
+        logger.info("browser started")
 
     def close(self):
         try:
             if self.page:
-                try:
-                    self.page.close()
-                except Exception:
-                    pass
-                self.page = None
+                self.page.close()
             if self.context:
-                try:
-                    self.context.close()
-                except Exception:
-                    pass
-                self.context = None
+                self.context.close()
             if self.browser:
-                try:
-                    self.browser.close()
-                except Exception:
-                    pass
-                self.browser = None
-        finally:
-            if self.playwright:
-                try:
-                    self.playwright.stop()
-                except Exception:
-                    pass
-                self.playwright = None
-            logger.info("✓ browser closed")
-
-    def _has_search_results(self, html: str) -> bool:
-        t = (html or "")
-        return ("Approximate Age" in t) or ("Current Location" in t) or ("people in" in t.lower())
-
-    def _is_cloudflare_challenge(self, page) -> bool:
-        try:
-            content = page.content()
-            lower = content.lower()
-            return (
-                "cloudflare" in lower
-                and (
-                    "challenge" in lower
-                    or "security check" in lower
-                    or "please verify you are human" in lower
-                    or "请验证您是真人" in content
-                    or "正在进行安全验证" in content
-                    or "checking your browser" in lower
-                )
-            )
+                self.browser.close()
+            if hasattr(self, "_pw"):
+                self._pw.stop()
         except Exception:
-            return False
+            pass
+        logger.info("browser closed")
 
-    def _handle_cloudflare_challenge(self, page) -> bool:
-        cf_mode = getattr(config, "CF_MODE", "skip")
-        logger.info(f"cloudflare challenge detected, CF_MODE={cf_mode}")
+    # -----------------------
+    # Public API
+    # -----------------------
+    def search_person(self, full_name: str) -> List[Dict]:
+        full_name = (full_name or "").strip()
+        if not full_name:
+            return []
 
-        if cf_mode == "skip":
+        logger.info(f"searching: {full_name}")
+        person_url = f"{self.search_url}/{self._slug_name(full_name)}"
+        logger.info(f"url: {person_url}")
+
+        # 1) Try cloudscraper first
+        html = self._fetch_with_cloudscraper(person_url, full_name)
+
+        # 2) Parse with regex quickly
+        if html:
+            results = self._extract_candidates_from_html(html, full_name, person_url)
+            if results:
+                logger.info(f"[cloudscraper/{full_name}] candidates={len(results)}")
+                return results
+
+        # 3) Fallback to Playwright
+        logger.info("cloudscraper failed, fallback to playwright")
+        results = self._fetch_with_playwright(full_name, person_url)
+        return results
+
+    # 兼容 main.py 旧调用
+    def search_by_name(self, full_name: str) -> List[Dict]:
+        return self.search_person(full_name)
+
+    # -----------------------
+    # HTTP path: cloudscraper
+    # -----------------------
+    def _fetch_with_cloudscraper(self, url: str, full_name: str) -> Optional[str]:
+        logger.info("using cloudscraper...")
+        s = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+        for i in range(1, self.max_retries + 1):
+            try:
+                r = s.get(url, timeout=20)
+                if r.status_code == 200 and r.text:
+                    return r.text
+                raise RuntimeError(f"HTTP {r.status_code}")
+            except Exception as e:
+                if i >= self.max_retries:
+                    logger.error(f"[cloudscraper/{full_name}] all {self.max_retries} retries failed: {e}")
+                    return None
+                delay = self.retry_base_delay * (2 ** (i - 1)) + random.uniform(0.2, 0.9)
+                logger.warning(f"[cloudscraper/{full_name}] retry {i}/{self.max_retries} after {delay:.1f}s, error: {e}")
+                time.sleep(delay)
+        return None
+
+    # -----------------------
+    # Browser path: playwright
+    # -----------------------
+    def _fetch_with_playwright(self, full_name: str, url: str) -> List[Dict]:
+        if not self.page:
+            self.start()
+
+        # Robust goto with retry
+        ok = self._goto_with_retry(self.page, url, f"list/{full_name}")
+        if not ok:
+            return []
+
+        # If blocked by Cloudflare or 1015, handle it
+        if self._is_cloudflare_challenge(self.page) or self._is_rate_limited_1015(self.page):
+            logger.info("cloudflare/1015 detected")
+            if not self._handle_blocking_challenge(self.page, f"list/{full_name}"):
+                logger.warning("blocking page unresolved, skip this record")
+                return []
+
+        # parse first page + pagination
+        candidates = self._extract_candidates_from_page(self.page, full_name)
+        all_candidates = list(candidates)
+        seen_keys = {self._candidate_key(x) for x in all_candidates}
+
+        page_num = 1
+        while True:
+            if self.max_pages > 0 and page_num >= self.max_pages:
+                break
+
+            next_btn = self._find_next_button(self.page)
+            if not next_btn:
+                break
+
+            try:
+                next_btn.click(timeout=5000)
+                self.page.wait_for_load_state("domcontentloaded", timeout=self.timeout)
+                time.sleep(self.wait_time)
+            except Exception:
+                break
+
+            if self._is_cloudflare_challenge(self.page) or self._is_rate_limited_1015(self.page):
+                logger.info("cloudflare/1015 detected on next page")
+                if not self._handle_blocking_challenge(self.page, f"list-page{page_num+1}/{full_name}"):
+                    logger.warning("blocking unresolved on paginated page, stop pagination")
+                    break
+
+            page_items = self._extract_candidates_from_page(self.page, full_name)
+            for item in page_items:
+                k = self._candidate_key(item)
+                if k not in seen_keys:
+                    seen_keys.add(k)
+                    all_candidates.append(item)
+
+            page_num += 1
+
+        if self.max_candidates and len(all_candidates) > self.max_candidates:
+            all_candidates = all_candidates[: self.max_candidates]
+
+        # fetch detail phones (serial)
+        enriched = []
+        for c in all_candidates:
+            detail_url = c.get("detail_url")
+            if detail_url:
+                phone = self._extract_phone_from_detail(detail_url, full_name)
+                if phone:
+                    c["phone"] = phone
+            enriched.append(c)
+
+        # filter by age/phone type if needed
+        filtered = [x for x in enriched if self._age_ok(x.get("age"))]
+        if self.only_wireless:
+            filtered = [x for x in filtered if self._looks_wireless(x.get("phone", ""))]
+
+        logger.info(f"[✓] matched {len(filtered)} result(s)")
+        return filtered
+
+    # -----------------------
+    # Challenge handling
+    # -----------------------
+    def _handle_blocking_challenge(self, page, tag: str) -> bool:
+        mode = (self.cf_mode or "skip").lower().strip()
+
+        if mode == "skip":
             logger.warning("CF_MODE=skip, skip this record")
             return False
 
-        if cf_mode == "manual":
-            max_wait = int(getattr(config, "CF_MANUAL_MAX_WAIT", 1200) or 1200)  # 默认20分钟
-            check_interval = 2.0
-            start = time.time()
-            logger.warning(
-                f"检测到 Cloudflare 验证，请在浏览器中完成验证。程序将最多等待 {max_wait}s，不会提前关闭页面。"
-            )
+        if mode == "retry":
+            logger.info("CF_MODE=retry, sleeping then retry once")
+            time.sleep(8)
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=self.timeout)
+                time.sleep(self.wait_time)
+            except Exception:
+                pass
+            return not (self._is_cloudflare_challenge(page) or self._is_rate_limited_1015(page))
 
-            while True:
-                elapsed = time.time() - start
-                if elapsed > max_wait:
-                    logger.warning("等待人工验证超时，跳过当前记录")
-                    return False
+        # manual
+        logger.warning(
+            f"[{tag}] 检测到 Cloudflare/1015。请现在手动处理（可切换VPN、过验证），"
+            f"完成后程序会自动继续。最长等待 {self.cf_manual_max_wait}s"
+        )
+        start = time.time()
+        last_log_sec = -1
 
+        while True:
+            elapsed = int(time.time() - start)
+            if elapsed > int(self.cf_manual_max_wait):
+                logger.warning(f"[{tag}] 等待人工处理超时（{self.cf_manual_max_wait}s），跳过")
+                return False
+
+            blocked = self._is_cloudflare_challenge(page) or self._is_rate_limited_1015(page)
+            if not blocked:
                 try:
-                    if not self._is_cloudflare_challenge(page):
-                        try:
-                            page.wait_for_load_state("domcontentloaded", timeout=8000)
-                        except Exception:
-                            pass
-                        logger.info("✓ Cloudflare 验证通过，继续")
-                        return True
-                except Exception as e:
-                    logger.debug(f"检查 Cloudflare 状态异常: {e}")
-
-                if int(elapsed) % 10 == 0:
-                    logger.info(f"仍在等待人工验证... {int(elapsed)}s/{max_wait}s")
-
-                time.sleep(check_interval)
-
-        # retry/other
-        try:
-            page.wait_for_load_state("networkidle", timeout=30000)
-            if not self._is_cloudflare_challenge(page):
-                logger.info("✓ cloudflare auto-resolved")
+                    page.wait_for_load_state("domcontentloaded", timeout=8000)
+                except Exception:
+                    pass
+                logger.info(f"[{tag}] ✓ 阻断已解除，继续")
                 return True
+
+            # 每10秒打一条日志，避免刷屏
+            if elapsed % 10 == 0 and elapsed != last_log_sec:
+                last_log_sec = elapsed
+                logger.info(f"[{tag}] 仍在等待人工处理（可切换VPN后重试）... {elapsed}s/{self.cf_manual_max_wait}s")
+
+            time.sleep(2)
+
+    def _is_cloudflare_challenge(self, page) -> bool:
+        try:
+            html = page.content().lower()
+            title = (page.title() or "").lower()
+            url = (page.url or "").lower()
+            keys = [
+                "checking your browser",
+                "cf-challenge",
+                "cloudflare",
+                "attention required",
+                "/cdn-cgi/challenge-platform/",
+                "just a moment",
+            ]
+            if any(k in html for k in keys):
+                return True
+            if any(k in title for k in keys):
+                return True
+            if "/cdn-cgi/" in url:
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _is_rate_limited_1015(self, page) -> bool:
+        try:
+            content = page.content()
+            low = content.lower()
+            return (
+                "error 1015" in low
+                or "you are being rate limited" in low
+                or "rate limited" in low
+                or "访问受限" in content
+                or "请求过多" in content
+            )
+        except Exception:
+            return False
+
+    # -----------------------
+    # Parsing candidates
+    # -----------------------
+    def _extract_candidates_from_html(self, html: str, full_name: str, base_url: str) -> List[Dict]:
+        cards = re.findall(r'href="(/person/[^"]+)"', html, flags=re.I)
+        uniq = []
+        seen = set()
+        for p in cards:
+            if p not in seen:
+                seen.add(p)
+                uniq.append(p)
+
+        out = []
+        for p in uniq[: self.max_candidates]:
+            detail = self.base_url + p
+            out.append(
+                {
+                    "query_name": full_name,
+                    "name": self._name_from_slug(p),
+                    "age": None,
+                    "location": "",
+                    "phone": "",
+                    "detail_url": detail,
+                    "source_url": base_url,
+                }
+            )
+        return out
+
+    def _extract_candidates_from_page(self, page, full_name: str) -> List[Dict]:
+        out: List[Dict] = []
+
+        links = page.locator('a[href^="/person/"], a[href*="/person/"]').all()
+        seen: Set[str] = set()
+
+        for a in links:
+            try:
+                href = a.get_attribute("href") or ""
+                if not href or "/person/" not in href:
+                    continue
+
+                if href.startswith("/"):
+                    detail_url = self.base_url + href
+                elif href.startswith("http"):
+                    detail_url = href
+                else:
+                    detail_url = f"{self.base_url}/{href.lstrip('/')}"
+
+                if detail_url in seen:
+                    continue
+                seen.add(detail_url)
+
+                card_text = ""
+                try:
+                    card_text = a.locator("xpath=ancestor::*[self::div or self::li][1]").inner_text(timeout=500)
+                except Exception:
+                    try:
+                        card_text = a.inner_text(timeout=500)
+                    except Exception:
+                        card_text = ""
+
+                name = self._extract_name_from_text_or_url(card_text, detail_url)
+                age = self._extract_age(card_text)
+                loc = self._extract_location(card_text)
+
+                out.append(
+                    {
+                        "query_name": full_name,
+                        "name": name,
+                        "age": age,
+                        "location": loc,
+                        "phone": "",
+                        "detail_url": detail_url,
+                        "source_url": page.url,
+                    }
+                )
+            except Exception:
+                continue
+
+        return out[: self.max_candidates]
+
+    def _extract_phone_from_detail(self, detail_url: str, full_name: str) -> str:
+        p = self.context.new_page()
+        try:
+            ok = self._goto_with_retry(p, detail_url, f"detail/{full_name}")
+            if not ok:
+                return ""
+
+            if self._is_cloudflare_challenge(p) or self._is_rate_limited_1015(p):
+                logger.info("cloudflare/1015 detected on detail page")
+                if not self._handle_blocking_challenge(p, f"detail/{full_name}"):
+                    return ""
+
+            text = ""
+            try:
+                text = p.inner_text("body", timeout=5000)
+            except Exception:
+                try:
+                    text = p.content()
+                except Exception:
+                    text = ""
+
+            phones = self._find_phones(text)
+            return phones[0] if phones else ""
+        finally:
+            try:
+                p.close()
+            except Exception:
+                pass
+
+    # -----------------------
+    # Helpers
+    # -----------------------
+    def _goto_with_retry(self, page, url: str, tag: str) -> bool:
+        for i in range(1, self.max_retries + 1):
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
+                time.sleep(self.wait_time)
+                return True
+            except PlaywrightTimeoutError as e:
+                if i >= self.max_retries:
+                    logger.error(f"[{tag}] goto timeout after retries: {e}")
+                    return False
+                delay = self.retry_base_delay * (2 ** (i - 1)) + random.uniform(0.3, 1.0)
+                logger.warning(f"[{tag}] goto retry {i}/{self.max_retries} after {delay:.1f}s")
+                time.sleep(delay)
+            except Exception as e:
+                if i >= self.max_retries:
+                    logger.error(f"[{tag}] goto failed: {e}")
+                    return False
+                delay = self.retry_base_delay * (2 ** (i - 1)) + random.uniform(0.3, 1.0)
+                logger.warning(f"[{tag}] goto retry {i}/{self.max_retries} after {delay:.1f}s, err={e}")
+                time.sleep(delay)
+        return False
+
+    def _find_next_button(self, page):
+        selectors = [
+            'a[rel="next"]',
+            'a:has-text("Next")',
+            'button:has-text("Next")',
+            'a:has-text("›")',
+            'a:has-text(">")',
+        ]
+        for s in selectors:
+            try:
+                el = page.locator(s).first
+                if el.count() > 0 and el.is_visible():
+                    return el
+            except Exception:
+                continue
+        return None
+
+    def _extract_name_from_text_or_url(self, text: str, detail_url: str) -> str:
+        txt = (text or "").strip()
+        m = re.search(r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})", txt)
+        if m:
+            return m.group(1).strip()
+        return self._name_from_slug(detail_url)
+
+    def _name_from_slug(self, url_or_path: str) -> str:
+        s = url_or_path.split("/person/")[-1].strip("/")
+        s = s.split("?")[0]
+        s = s.replace("-", " ")
+        return " ".join([w.capitalize() for w in s.split() if w])
+
+    def _slug_name(self, name: str) -> str:
+        name = re.sub(r"\s+", "-", name.strip().lower())
+        name = re.sub(r"[^a-z0-9\-]", "", name)
+        return name
+
+    def _extract_age(self, text: str) -> Optional[int]:
+        if not text:
+            return None
+        m = re.search(r"\b(?:age)\s*[:\-]?\s*(\d{1,3})\b", text, re.I)
+        if not m:
+            m = re.search(r"\b(\d{2})\s*(?:years old|yrs old|yo)\b", text, re.I)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return None
+        return None
+
+    def _extract_location(self, text: str) -> str:
+        if not text:
+            return ""
+        m = re.search(r"\b([A-Z][a-z]+,\s*[A-Z]{2})\b", text)
+        return m.group(1) if m else ""
+
+    def _find_phones(self, text: str) -> List[str]:
+        if not text:
+            return []
+        pats = [
+            r"\+1[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{4}",
+            r"\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{4}",
+        ]
+        seen = set()
+        out = []
+        for p in pats:
+            for m in re.findall(p, text):
+                n = self._norm_phone(m)
+                if n and n not in seen:
+                    seen.add(n)
+                    out.append(n)
+        return out
+
+    def _norm_phone(self, p: str) -> str:
+        d = re.sub(r"\D", "", p or "")
+        if len(d) == 11 and d.startswith("1"):
+            d = d[1:]
+        if len(d) != 10:
+            return ""
+        return f"({d[0:3]}) {d[3:6]}-{d[6:10]}"
+
+    def _age_ok(self, age: Optional[int]) -> bool:
+        if age is None:
+            return True
+        return self.min_age <= age <= self.max_age
+
+    def _looks_wireless(self, phone: str) -> bool:
+        return bool(phone)
+
+    def _candidate_key(self, x: Dict) -> Tuple[str, str, str, str]:
+        return (
+            (x.get("name") or "").strip().lower(),
+            str(x.get("age") or "").strip().lower(),
+            (x.get("location") or "").strip().lower(),
+            (x.get("phone") or "").strip().lower(),
+        )
+
+
+def append_results_dedup(csv_path: str, rows: List[Dict]):
+    if not rows:
+        return
+    path = Path(csv_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = ["query_name", "name", "age", "location", "phone", "detail_url", "source_url"]
+
+    existed = set()
+    if path.exists():
+        try:
+            with path.open("r", newline="", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for r in reader:
+                    k = (
+                        (r.get("name") or "").strip().lower(),
+                        str(r.get("age") or "").strip().lower(),
+                        (r.get("location") or "").strip().lower(),
+                        (r.get("phone") or "").strip().lower(),
+                    )
+                    existed.add(k)
         except Exception:
             pass
 
-        time.sleep(5)
-        if self._is_cloudflare_challenge(page):
-            logger.warning("cloudflare still present")
-            return False
-        return True
-
-    def search_by_name(self, name: str) -> List[Dict]:
-        try:
-            slug = name.replace(" ", "-").lower()
-            search_url = f"{config.SEARCH_URL}/{slug}"
-            logger.info(f"searching: {name}")
-            logger.info(f"url: {search_url}")
-
-            if self.scraper:
-                logger.info("using cloudscraper...")
-                try:
-                    html = retry_with_backoff(
-                        lambda: self._fetch_with_cloudscraper(search_url),
-                        label=f"cloudscraper/{name}",
-                    )
-                    if html and self._has_search_results(html):
-                        rows = self._extract_results_from_html(html, name)
-                        if rows:
-                            return rows
-                except Exception:
-                    logger.info("cloudscraper failed, fallback to playwright")
-
-            if not self.page:
-                self.init_browser()
-
-            retry_with_backoff(
-                lambda: self.page.goto(search_url, wait_until="load"),
-                max_retries=3,
-                base_delay=2.0,
-                label=f"page.goto/{name}",
-            )
-            time.sleep(max(0.2, float(config.WAIT_TIME)))
-
-            if self._is_cloudflare_challenge(self.page):
-                ok = self._handle_cloudflare_challenge(self.page)
-                if not ok:
-                    return []
-
-            try:
-                self.page.wait_for_selector(
-                    'a:has-text("View All Info"), div:has-text("Approximate Age"), div:has-text("Current Location")',
-                    timeout=5000,
-                )
-            except Exception:
-                pass
-
-            return self._extract_results_from_dom(name)
-
-        except Exception as e:
-            logger.error(f"search failed: {e}")
-            return []
-
-    def _fetch_with_cloudscraper(self, url: str) -> Optional[str]:
-        resp = self.scraper.get(url, timeout=30)
-        if resp.status_code == 200:
-            return resp.text
-        raise RuntimeError(f"HTTP {resp.status_code}")
-
-    def _extract_results_from_html(self, html: str, search_name: str) -> List[Dict]:
-        results = []
-        if not self._has_search_results(html):
-            return results
-
-        pattern = r"Approximate Age[:=\s]+(\d+)"
-        for m in re.findall(pattern, html, re.IGNORECASE):
-            try:
-                age = int(m)
-            except Exception:
-                continue
-            if config.MIN_AGE <= age <= config.MAX_AGE:
-                results.append({"name": "", "age": age, "location": "Unknown", "phone": ""})
-        return results
-
-    def _extract_results_from_dom(self, search_name: str) -> List[Dict]:
-        logger.info("start extracting candidates from list page...")
-        candidates = self._extract_candidates_from_dom(search_name)
-
-        max_candidates = int(getattr(config, "MAX_CANDIDATES_PER_QUERY", 30) or 30)
-        if max_candidates > 0:
-            candidates = candidates[:max_candidates]
-
-        logger.info(f"✓ list page candidates: {len(candidates)}, start detail phone extraction...")
-
-        if not candidates:
-            return []
-
-        results: List[Dict] = []
-        seen_keys = set()
-
-        for c in candidates:
-            detail_url = c.get("detail_url", "")
-            age = c.get("age", -1)
-            location = c.get("location", "Unknown")
-
-            phones = self._get_phones_from_detail_page(detail_url, "")
-            if not phones:
-                phones = [""]
-
-            for phone in phones:
-                row = {"name": "", "age": age, "location": location, "phone": phone}
-                key = _dedup_key(row)
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                results.append(row)
-
-        logger.info(f"✓ extracted {len(results)} records")
-        return results
-
-    def _extract_candidates_from_dom(self, search_name: str) -> List[Dict]:
-        candidates: List[Dict] = []
-        seen_urls = set()
-
-        def _collect_current_page() -> List[Dict]:
-            try:
-                raw = self.page.evaluate(
-                    """
-() => {
-  function txt(el){ return (el && (el.innerText || el.textContent) || '').trim(); }
-  function pickCard(a){
-    let n = a;
-    for(let i=0;i<12 && n;i++){
-      const t = txt(n);
-      if(/(Approximate\\s+Age|Current\\s+Location|Lives\\s+in|\\bAge\\b)/i.test(t)) return n;
-      n = n.parentElement;
-    }
-    return a.closest('article,li,section,div,tr') || a.parentElement;
-  }
-
-  const anchors = Array.from(document.querySelectorAll('a[href]')).filter(a => {
-    const t = txt(a);
-    const h = a.getAttribute('href') || '';
-    return /view\\s+all\\s+info/i.test(t) || /\\/name\\/|\\/person\\/|\\/details\\//i.test(h);
-  });
-
-  return anchors.map(a => {
-    const card = pickCard(a);
-    const t = txt(card);
-
-    const ageM = t.match(/Approximate\\s+Age[:\\s]*([0-9]{1,3})/i) || t.match(/\\bAge[:\\s]*([0-9]{1,3})/i);
-    const locM = t.match(/Current\\s+Location[:\\s]*([^\\n\\r]+)/i) || t.match(/Lives\\s+in[:\\s]*([^\\n\\r]+)/i);
-
-    return {
-      age: ageM ? ageM[1] : '',
-      location: locM ? locM[1].trim() : '',
-      detail_url: a.href || ''
-    };
-  });
-}
-                    """
-                )
-                return raw or []
-            except Exception as e:
-                logger.debug(f"collect current page failed: {e}")
-                return []
-
-        def _go_next_page() -> bool:
-            try:
-                next_exists = self.page.evaluate(
-                    """
-() => {
-  function txt(el){ return (el && (el.innerText || el.textContent) || '').trim().toLowerCase(); }
-
-  let cands = Array.from(document.querySelectorAll('a,button,[role="button"]')).filter(el => {
-    const t = txt(el);
-    return t === 'next' || t.includes('next') || t === '>' || t === '›' || t === '→';
-  });
-
-  const relNext = document.querySelector('a[rel="next"]');
-  if (relNext) cands.unshift(relNext);
-
-  for (const el of cands) {
-    const ariaDisabled = (el.getAttribute('aria-disabled') || '').toLowerCase();
-    const cls = (el.className || '').toString().toLowerCase();
-    const disabled = el.disabled || ariaDisabled === 'true' || cls.includes('disabled');
-    if (disabled) continue;
-
-    const rect = el.getBoundingClientRect();
-    const visible = rect.width > 0 && rect.height > 0;
-    if (!visible) continue;
-
-    return true;
-  }
-  return false;
-}
-                    """
-                )
-                if not next_exists:
-                    return False
-
-                clicked = self.page.evaluate(
-                    """
-() => {
-  function txt(el){ return (el && (el.innerText || el.textContent) || '').trim().toLowerCase(); }
-
-  let cands = Array.from(document.querySelectorAll('a,button,[role="button"]')).filter(el => {
-    const t = txt(el);
-    return t === 'next' || t.includes('next') || t === '>' || t === '›' || t === '→';
-  });
-
-  const relNext = document.querySelector('a[rel="next"]');
-  if (relNext) cands.unshift(relNext);
-
-  for (const el of cands) {
-    const ariaDisabled = (el.getAttribute('aria-disabled') || '').toLowerCase();
-    const cls = (el.className || '').toString().toLowerCase();
-    const disabled = el.disabled || ariaDisabled === 'true' || cls.includes('disabled');
-    if (disabled) continue;
-
-    const rect = el.getBoundingClientRect();
-    const visible = rect.width > 0 && rect.height > 0;
-    if (!visible) continue;
-
-    el.scrollIntoView({block:'center'});
-    el.click();
-    return true;
-  }
-  return false;
-}
-                    """
-                )
-                if not clicked:
-                    return False
-
-                try:
-                    self.page.wait_for_load_state("domcontentloaded", timeout=15000)
-                except Exception:
-                    pass
-
-                time.sleep(max(0.4, float(getattr(config, "WAIT_TIME", 1.0))))
-                return True
-
-            except Exception as e:
-                logger.debug(f"go next page failed: {e}")
-                return False
-
-        page_no = 1
-        max_pages = int(getattr(config, "MAX_PAGES", 0) or 0)  # 0 = until last page
-
-        while True:
-            logger.info(f"collecting candidates from page {page_no}...")
-            raw_items = _collect_current_page()
-
-            added_this_page = 0
-            for item in raw_items:
-                age_raw = str(item.get("age", "")).strip()
-                age = int(age_raw) if age_raw.isdigit() else -1
-                if age != -1 and not (config.MIN_AGE <= age <= config.MAX_AGE):
-                    continue
-
-                detail_url = (item.get("detail_url") or "").strip()
-                if detail_url:
-                    detail_url = urljoin(config.BASE_URL, detail_url)
-                if not detail_url or detail_url in seen_urls:
-                    continue
-
-                location = (item.get("location") or "").strip() or "Unknown"
-                candidates.append({"name": "", "age": age, "location": location, "detail_url": detail_url})
-                seen_urls.add(detail_url)
-                added_this_page += 1
-
-            logger.info(f"page {page_no} added {added_this_page}, total candidates {len(candidates)}")
-
-            if max_pages > 0 and page_no >= max_pages:
-                logger.info(f"reached MAX_PAGES={max_pages}, stop paging")
-                break
-
-            moved = _go_next_page()
-            if not moved:
-                logger.info("reached last page (or no usable Next button)")
-                break
-
-            page_no += 1
-
-        return candidates
-
-    def _get_phones_from_detail_page(self, detail_url: str, person_name: str = "") -> List[str]:
-        if not detail_url:
-            return []
-
-        phones: List[str] = []
-        detail_page = None
-        try:
-            detail_page = self.context.new_page()
-            retry_with_backoff(
-                lambda: detail_page.goto(detail_url, wait_until="domcontentloaded"),
-                label=f"detail.goto/{detail_url}",
-            )
-            time.sleep(max(0.2, float(config.WAIT_TIME)))
-
-            if self._is_cloudflare_challenge(detail_page):
-                ok = self._handle_cloudflare_challenge(detail_page)
-                if not ok:
-                    return []
-
-            try:
-                detail_page.wait_for_selector(
-                    "span:has-text('Wireless'), span:has-text('Mobile'), a[href^='tel:']",
-                    timeout=3000,
-                )
-            except Exception:
-                pass
-
-            phones = self._extract_phones_from_page(detail_page)
-
-        except Exception as e:
-            logger.warning(f"detail extraction failed: {detail_url} | error: {e}")
-        finally:
-            if detail_page:
-                try:
-                    detail_page.close()
-                except Exception:
-                    pass
-
-        return phones
-
-    def _extract_phones_from_page(self, page) -> List[str]:
-        phones: List[str] = []
-        seen = set()
-
-        try:
-            elems = page.query_selector_all("a[href^='tel:'], li, div, span, td, p")
-            for elem in elems:
-                try:
-                    txt = (elem.inner_text() or "").strip()
-                except Exception:
-                    continue
-                if not txt:
-                    continue
-
-                low = txt.lower()
-                if config.ONLY_WIRELESS and ("wireless" not in low and "mobile" not in low):
-                    continue
-
-                m = PHONE_PATTERN.search(txt)
-                if not m:
-                    continue
-
-                phone = _normalize_phone(m.group(0))
-                if phone and phone not in seen:
-                    seen.add(phone)
-                    phones.append(phone)
-
-            if not phones:
-                full = page.evaluate("document.body.innerText || ''")
-                for line in full.splitlines():
-                    s = line.strip()
-                    if not s:
-                        continue
-                    low = s.lower()
-                    if config.ONLY_WIRELESS and ("wireless" not in low and "mobile" not in low):
-                        continue
-                    m = PHONE_PATTERN.search(s)
-                    if not m:
-                        continue
-                    phone = _normalize_phone(m.group(0))
-                    if phone and phone not in seen:
-                        seen.add(phone)
-                        phones.append(phone)
-
-        except Exception as e:
-            logger.debug(f"phone extraction failed: {e}")
-
-        return phones
-
-    def save_results(self, results: List[Dict], filename: str):
-        if not results:
-            logger.warning("no results to save")
-            return
-
-        output_path = Path(filename)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        fieldnames = ["name", "age", "location", "phone"]
-        existing_records: List[Dict] = []
-        existing_keys = set()
-
-        if output_path.exists():
-            try:
-                with open(output_path, "r", newline="", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        existing_records.append(row)
-                        existing_keys.add(_dedup_key(row))
-                logger.info(f"existing records: {len(existing_records)}")
-            except Exception as e:
-                logger.warning(f"read existing csv failed, overwrite mode: {e}")
-
-        new_records = []
-        for r in results:
-            key = _dedup_key(r)
-            if key not in existing_keys:
-                existing_keys.add(key)
-                new_records.append(r)
-
-        if not new_records:
-            logger.info(f"all {len(results)} records already exist, no write")
-            return
-
-        all_records = existing_records + new_records
-        with open(output_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(all_records)
-
-        logger.info(f"✓ added {len(new_records)} rows, total {len(all_records)} rows, saved to {filename}")
+    to_write = []
+    for r in rows:
+        k = (
+            (r.get("name") or "").strip().lower(),
+            str(r.get("age") or "").strip().lower(),
+            (r.get("location") or "").strip().lower(),
+            (r.get("phone") or "").strip().lower(),
+        )
+        if k in existed:
+            continue
+        existed.add(k)
+        to_write.append(r)
+
+    if not to_write:
+        return
+
+    write_header = not path.exists()
+    with path.open("a", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            w.writeheader()
+        for r in to_write:
+            w.writerow({k: r.get(k, "") for k in fieldnames})
