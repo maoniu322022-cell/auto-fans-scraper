@@ -1,3 +1,6 @@
 ﻿__pycache__/
 *.pyc
 .env
+logs/
+data/results.csv
+name_patch_snippet.py
