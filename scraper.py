@@ -5,6 +5,7 @@ import time
 import csv
 from typing import List, Dict, Optional
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 try:
@@ -19,10 +20,20 @@ logger = logging.getLogger(__name__)
 
 # ─── 去重键 ──────────────────────────────────────────────────────────────────
 DEDUP_FIELDS = ("name", "age", "location", "phone")
+PHONE_PATTERN = re.compile(r'(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}')
 
 
 def _dedup_key(record: Dict) -> tuple:
     return tuple(str(record.get(f, "")).strip() for f in DEDUP_FIELDS)
+
+
+def _normalize_phone(raw: str) -> str:
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) == 10:
+        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+    return (raw or "").strip()
 
 
 # ─── 统一重试包装 ─────────────────────────────────────────────────────────────
@@ -316,64 +327,32 @@ class PeopleSearchScraper:
 
         try:
             logger.info("开始从页面提取所有符合条件的人员...")
+            candidates = self._extract_candidates_from_dom(search_name)
+            logger.info(f"✓ 列表页命中 {len(candidates)} 条候选记录，开始详情页提取电话...")
 
-            page_text = self.page.evaluate('document.body.innerText')
-            lines = page_text.split('\n')
             seen_keys: set = set()
+            for candidate in candidates:
+                person_name = candidate["name"]
+                age = candidate["age"]
+                location = candidate["location"]
+                detail_url = candidate.get("detail_url", "")
 
-            for i, line in enumerate(lines):
-                line = line.strip()
+                phones = self._get_phones_from_detail_page(detail_url, person_name)
+                logger.info(f"详情提取: {person_name} | 电话数量: {len(phones)}")
 
-                age_match = re.search(r'Approximate Age[:=\s]*(\d+)', line, re.IGNORECASE)
-                if not age_match:
-                    continue
+                if not phones:
+                    phones = ["未获取"]
 
-                age = int(age_match.group(1))
-                if not (config.MIN_AGE <= age <= config.MAX_AGE):
-                    continue
-
-                # 回溯找名字
-                person_name = "Unknown"
-                for j in range(i - 1, max(0, i - 5), -1):
-                    prev_line = lines[j].strip()
-                    if prev_line and re.match(r'^[A-Z][a-z]+ [A-Z][a-z]+', prev_line):
-                        person_name = prev_line
-                        break
-
-                # 查找位置信息
-                location = "Unknown"
-                for j in range(i + 1, min(len(lines), i + 5)):
-                    next_line = lines[j].strip()
-                    if "Current Location" in next_line:
-                        loc_match = re.search(
-                            r'Current Location[:=\s]*([^\n]+)', next_line, re.IGNORECASE
-                        )
-                        if loc_match:
-                            location = loc_match.group(1).strip()
-                        break
-
-                # 查找电话信息
-                phone = "未获取"
-                if config.ONLY_WIRELESS:
-                    for j in range(i + 1, min(len(lines), i + 10)):
-                        next_line = lines[j].strip()
-                        if "Wireless" in next_line or "Mobile" in next_line:
-                            phone_match = re.search(
-                                r'\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}', next_line
-                            )
-                            if phone_match:
-                                phone = phone_match.group(0).strip()
-                                break
-
-                result = {
-                    "name": person_name,
-                    "age": age,
-                    "location": location,
-                    "phone": phone
-                }
-
-                key = _dedup_key(result)
-                if key not in seen_keys:
+                for phone in phones:
+                    result = {
+                        "name": person_name,
+                        "age": age,
+                        "location": location,
+                        "phone": phone
+                    }
+                    key = _dedup_key(result)
+                    if key in seen_keys:
+                        continue
                     seen_keys.add(key)
                     results.append(result)
                     logger.info(
@@ -389,17 +368,120 @@ class PeopleSearchScraper:
             logger.debug(traceback.format_exc())
             return []
 
-    def _get_phones_from_detail_page(self, button) -> List[str]:
-        """点击按钮获取详情页电话"""
-        phones = []
+    def _extract_candidates_from_dom(self, search_name: str) -> List[Dict]:
+        """从列表页提取候选人员（含详情链接）"""
+        candidates: List[Dict] = []
+        seen_urls: set = set()
 
         try:
-            logger.debug("点击 View All Info 按钮...")
+            raw_candidates = self.page.evaluate("""
+() => {
+  const links = Array.from(document.querySelectorAll('a'))
+    .filter(a => /view\\s+all\\s+info/i.test((a.textContent || '').trim()));
 
-            with self.page.context.expect_page() as new_page_info:
-                button.click()
+  return links.map((link) => {
+    let card = link.closest('article, li, section, div');
+    let probe = card;
+    for (let i = 0; i < 6 && probe; i++) {
+      const txt = (probe.innerText || '').trim();
+      if (/Approximate\\s+Age/i.test(txt) || /Current\\s+Location/i.test(txt)) {
+        card = probe;
+        break;
+      }
+      probe = probe.parentElement;
+    }
 
-            detail_page = new_page_info.value
+    const cardText = card ? (card.innerText || '') : '';
+    const ageMatch = cardText.match(/Approximate\\s+Age[:=\\s]*(\\d+)/i);
+    const locationMatch = cardText.match(/Current\\s+Location[:=\\s]*([^\\n]+)/i);
+    const nameNodes = card
+      ? Array.from(card.querySelectorAll('h1, h2, h3, h4, [data-testid*="name"], a[href*="/person/"]'))
+      : [];
+
+    let name = '';
+    for (const node of nameNodes) {
+      const txt = (node.textContent || '').trim();
+      if (!txt) continue;
+      if (/view\\s+all\\s+info/i.test(txt)) continue;
+      if (/approximate\\s+age|current\\s+location/i.test(txt)) continue;
+      name = txt;
+      break;
+    }
+
+    return {
+      name,
+      age: ageMatch ? ageMatch[1] : '',
+      location: locationMatch ? locationMatch[1].trim() : '',
+      detail_url: link.href || ''
+    };
+  });
+}
+            """)
+        except Exception as e:
+            logger.debug(f"列表页 DOM 候选提取失败: {e}")
+            raw_candidates = []
+
+        for item in raw_candidates or []:
+            try:
+                age = int(str(item.get("age", "")).strip())
+            except Exception:
+                continue
+
+            if not (config.MIN_AGE <= age <= config.MAX_AGE):
+                continue
+
+            detail_url = item.get("detail_url", "") or ""
+            if detail_url:
+                detail_url = urljoin(config.BASE_URL, detail_url)
+            if detail_url in seen_urls:
+                continue
+
+            person_name = (item.get("name", "") or "").strip()
+            if not person_name or re.search(r'view\s+all', person_name, re.IGNORECASE):
+                person_name = self._guess_name_from_detail_url(detail_url) or search_name
+
+            location = (item.get("location", "") or "").strip() or "Unknown"
+
+            candidates.append({
+                "name": person_name,
+                "age": age,
+                "location": location,
+                "detail_url": detail_url
+            })
+            if detail_url:
+                seen_urls.add(detail_url)
+
+        return candidates
+
+    def _guess_name_from_detail_url(self, detail_url: str) -> str:
+        """从详情页 URL 猜测姓名"""
+        if not detail_url:
+            return ""
+        try:
+            path = urlparse(detail_url).path.strip("/")
+            slug = path.split("/")[-1]
+            if not slug:
+                return ""
+            slug = re.sub(r'-\d+$', '', slug)
+            words = [w for w in slug.split("-") if w and w.lower() not in {"person"}]
+            return " ".join(w.capitalize() for w in words)
+        except Exception:
+            return ""
+
+    def _get_phones_from_detail_page(self, detail_url: str, person_name: str = "") -> List[str]:
+        """访问详情页获取电话"""
+        phones = []
+        detail_page = None
+
+        try:
+            if not detail_url:
+                return []
+            detail_page = self.context.new_page()
+            logger.info(f"  ↳ 访问详情页: {person_name or detail_url}")
+            retry_with_backoff(
+                lambda: detail_page.goto(detail_url, wait_until="domcontentloaded"),
+                label=f"detail.goto/{person_name or detail_url}"
+            )
             time.sleep(config.WAIT_TIME)
 
             if self._is_cloudflare_challenge(detail_page):
@@ -413,42 +495,70 @@ class PeopleSearchScraper:
                     timeout=10000
                 )
             except Exception:
-                pass
+                logger.debug("详情页未命中 Wireless/Mobile 显式节点，使用回退提取")
 
             phones = self._extract_phones_from_page(detail_page)
-            detail_page.close()
 
         except Exception as e:
-            logger.debug(f"获取详情页失败: {e}")
+            logger.warning(f"详情页提取失败: {person_name or detail_url} | 错误: {e}")
+        finally:
+            try:
+                if detail_page:
+                    detail_page.close()
+            except Exception:
+                pass
 
         return phones
 
     def _extract_phones_from_page(self, page) -> List[str]:
         """从页面提取电话号码"""
-        phones = []
+        phones: List[str] = []
 
         try:
-            phone_elements = page.query_selector_all("span, div, td")
+            phone_elements = page.query_selector_all(
+                "a[href^='tel:'], li, div, span, td, p"
+            )
+            seen = set()
 
             for elem in phone_elements:
                 try:
-                    elem_text = elem.inner_text()
+                    elem_text = (elem.inner_text() or "").strip()
+                    if not elem_text:
+                        continue
+                    lowered = elem_text.lower()
 
-                    if "Wireless" not in elem_text and "Mobile" not in elem_text:
+                    if config.ONLY_WIRELESS and ("wireless" not in lowered and "mobile" not in lowered):
                         continue
 
-                    phone_match = re.search(
-                        r'\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}',
-                        elem_text
-                    )
-                    if phone_match:
-                        phone = phone_match.group(0).strip()
-                        if phone not in phones:
-                            phones.append(phone)
-                            logger.info(f"  ✓ 找到: {phone}")
+                    phone_match = PHONE_PATTERN.search(elem_text)
+                    if not phone_match:
+                        continue
+
+                    phone = _normalize_phone(phone_match.group(0))
+                    if phone and phone not in seen:
+                        seen.add(phone)
+                        phones.append(phone)
+                        logger.info(f"  ✓ 找到: {phone}")
 
                 except Exception:
                     continue
+
+            # 回退：全文正则（避免节点结构变化时全部漏掉）
+            if not phones:
+                full_text = page.evaluate("document.body.innerText || ''")
+                for line in full_text.splitlines():
+                    line_strip = line.strip()
+                    if not line_strip:
+                        continue
+                    lowered = line_strip.lower()
+                    if config.ONLY_WIRELESS and ("wireless" not in lowered and "mobile" not in lowered):
+                        continue
+                    phone_match = PHONE_PATTERN.search(line_strip)
+                    if not phone_match:
+                        continue
+                    phone = _normalize_phone(phone_match.group(0))
+                    if phone and phone not in phones:
+                        phones.append(phone)
 
             return phones
         except Exception as e:

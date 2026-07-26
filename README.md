@@ -74,6 +74,7 @@ cp .env.example .env
    ```
 
 3. 结果保存在 `data/results.csv`，日志在 `logs/app.log`。
+4. 电话号码会在列表页筛选后进入 **详情页** 提取（优先匹配 Wireless / Mobile），因此相比仅解析列表页会稍慢。
 
 ## 项目结构
 
@@ -107,6 +108,7 @@ auto-fans-scraper/
 
 ### 结果 CSV 中出现 "待获取" / "未获取"
 - cloudscraper 路径仅解析 HTML 文本，电话字段可能无法获取；Playwright 路径会尝试从页面 DOM 提取。
+- Playwright 路径会继续访问每条结果的详情页提取电话；若详情页无号码、受风控或访问失败，字段会保留为 `未获取`。
 - 两条路径均未能获取时，字段填 `待获取` / `未获取`。
 
 ## 注意事项
