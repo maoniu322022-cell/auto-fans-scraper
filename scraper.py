@@ -6,6 +6,7 @@ import csv
 from typing import List, Dict, Optional
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 try:
@@ -42,16 +43,6 @@ def retry_with_backoff(func, *, max_retries: int = None, base_delay: float = Non
                        label: str = "操作"):
     """
     对 func() 做指数退避重试（含随机抖动）。
-
-    参数:
-        func        – 无参可调用，直接调用执行目标动作
-        max_retries – 最大重试次数，默认读 config.MAX_RETRIES
-        base_delay  – 起始退避秒数，默认读 config.RETRY_BASE_DELAY
-        label       – 日志描述
-    返回:
-        func() 的返回值
-    抛出:
-        最后一次异常（所有重试耗尽后）
     """
     if max_retries is None:
         max_retries = config.MAX_RETRIES
@@ -63,14 +54,10 @@ def retry_with_backoff(func, *, max_retries: int = None, base_delay: float = Non
             return func()
         except Exception as exc:
             if attempt >= max_retries:
-                logger.error(
-                    f"[{label}] 全部 {max_retries} 次重试失败，最终错误: {exc}"
-                )
+                logger.error(f"[{label}] 全部 {max_retries} 次重试失败，最终错误: {exc}")
                 raise
             delay = base_delay * (2 ** attempt) + random.uniform(0, base_delay)
-            logger.warning(
-                f"[{label}] 第 {attempt + 1}/{max_retries} 次重试，等待 {delay:.1f}s，错误: {exc}"
-            )
+            logger.warning(f"[{label}] 第 {attempt + 1}/{max_retries} 次重试，等待 {delay:.1f}s，错误: {exc}")
             time.sleep(delay)
 
 
@@ -134,7 +121,6 @@ class PeopleSearchScraper:
             logger.debug(f"关闭浏览器时出错: {e}")
 
     def _has_search_results(self, html: str) -> bool:
-        """检查是否有搜索结果"""
         return (
             "Approximate Age" in html or
             "Current Location" in html or
@@ -142,7 +128,6 @@ class PeopleSearchScraper:
         )
 
     def _is_cloudflare_challenge(self, page) -> bool:
-        """检查是否是 Cloudflare 挑战页面"""
         try:
             content = page.content()
             return (
@@ -155,15 +140,7 @@ class PeopleSearchScraper:
             return False
 
     def _handle_cloudflare_challenge(self, page) -> bool:
-        """
-        根据 CF_MODE 处理 Cloudflare 挑战，不再阻塞 STDIN。
-
-        CF_MODE=manual : 等待有限时间让浏览器自动通过，超时后继续（不调用 input()）
-        CF_MODE=skip   : 记录日志后直接返回 False，由调用方跳过该记录
-        CF_MODE=retry  : 由调用方的 retry_with_backoff 处理重试；此处仅等待一次
-        """
         cf_mode = config.CF_MODE
-
         logger.info(f"⏳ 检测到 Cloudflare 挑战，CF_MODE={cf_mode}")
 
         if cf_mode == "skip":
@@ -197,28 +174,22 @@ class PeopleSearchScraper:
                         logger.info("✓ 已点击验证框")
                         time.sleep(2)
                         break
-                    except Exception as e:
-                        logger.debug(f"点击失败: {e}")
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
-        wait_sec = 15
-        logger.info(f"⏳ 等待验证完成 ({wait_sec}秒)...")
-        time.sleep(wait_sec)
+        time.sleep(15)
 
         if self._is_cloudflare_challenge(page):
-            logger.warning(
-                f"⚠️ Cloudflare 验证未完成 (CF_MODE={cf_mode})，继续处理（可能失败）"
-            )
+            logger.warning(f"⚠️ Cloudflare 验证未完成 (CF_MODE={cf_mode})，继续处理（可能失败）")
             return False
 
         logger.info("✓ Cloudflare 验证已完成")
         return True
 
     def search_by_name(self, name: str) -> List[Dict]:
-        """按名字搜索"""
         results = []
-
         try:
             search_url = f"{config.SEARCH_URL}/{name.replace(' ', '-').lower()}"
             logger.info(f"正在搜索: {name}")
@@ -243,32 +214,27 @@ class PeopleSearchScraper:
             if not self.page:
                 self.init_browser()
 
-            try:
-                retry_with_backoff(
-                    lambda: self.page.goto(search_url, wait_until="domcontentloaded"),
-                    label=f"page.goto/{name}"
-                )
-            except Exception as e:
-                logger.error(f"页面加载失败（已重试）: {e}")
-                return []
+            retry_with_backoff(
+                lambda: self.page.goto(search_url, wait_until="domcontentloaded"),
+                label=f"page.goto/{name}"
+            )
 
-            time.sleep(2)
+            time.sleep(1.0)
 
             if self._is_cloudflare_challenge(self.page):
                 cf_ok = self._handle_cloudflare_challenge(self.page)
                 if not cf_ok and config.CF_MODE == "skip":
                     return []
-                time.sleep(2)
+                time.sleep(1.0)
 
             try:
                 self.page.wait_for_selector(
-                    'div:has-text("Approximate Age"), div:has-text("Current Location")',
-                    timeout=10000
+                    'a:has-text("View All Info"), div:has-text("Approximate Age"), div:has-text("Current Location")',
+                    timeout=4000
                 )
             except Exception:
-                logger.debug("未找到结果选择器，继续处理...")
+                time.sleep(min(1.0, max(0.2, float(config.WAIT_TIME))))
 
-            time.sleep(config.WAIT_TIME)
             results = self._extract_results_from_dom(name)
             return results
 
@@ -295,11 +261,10 @@ class PeopleSearchScraper:
             try:
                 age = int(age_str)
                 if config.MIN_AGE <= age <= config.MAX_AGE:
-                    location = "Unknown"
                     results.append({
                         "name": "",
                         "age": age,
-                        "location": location,
+                        "location": "Unknown",
                         "phone": "待获取"
                     })
             except Exception:
@@ -309,40 +274,56 @@ class PeopleSearchScraper:
 
     def _extract_results_from_dom(self, search_name: str) -> List[Dict]:
         results = []
-
         try:
             logger.info("开始从页面提取所有符合条件的人员...")
             candidates = self._extract_candidates_from_dom(search_name)
+
+            max_candidates = int(getattr(config, "MAX_CANDIDATES_PER_QUERY", 30) or 30)
+            if max_candidates > 0:
+                candidates = candidates[:max_candidates]
+
             logger.info(f"✓ 列表页命中 {len(candidates)} 条候选记录，开始详情页提取电话...")
 
-            seen_keys: set = set()
-            for candidate in candidates:
-                person_name = ""   # 姓名固定为空
+            if not candidates:
+                return []
+
+            def _worker(candidate: Dict) -> List[Dict]:
                 age = candidate["age"]
                 location = candidate["location"]
                 detail_url = candidate.get("detail_url", "")
 
-                phones = self._get_phones_from_detail_page(detail_url, person_name)
-                logger.info(f"详情提取: [name-disabled] | 电话数量: {len(phones)}")
-
+                phones = self._get_phones_from_detail_page(detail_url, "")
                 if not phones:
                     phones = ["未获取"]
 
+                out = []
                 for phone in phones:
-                    result = {
+                    out.append({
                         "name": "",
                         "age": age,
                         "location": location,
                         "phone": phone
-                    }
-                    key = _dedup_key(result)
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
-                    results.append(result)
-                    logger.info(
-                        f"✓ 保存: [name-disabled] | 年龄: {age} | 位置: {location} | 电话: {phone}"
-                    )
+                    })
+                return out
+
+            max_workers = int(getattr(config, "DETAIL_CONCURRENCY", 4) or 4)
+            max_workers = max(1, min(max_workers, 8))
+
+            seen_keys: set = set()
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                future_map = {ex.submit(_worker, c): c for c in candidates}
+                for fut in as_completed(future_map):
+                    c = future_map[fut]
+                    try:
+                        rows = fut.result()
+                        for r in rows:
+                            key = _dedup_key(r)
+                            if key in seen_keys:
+                                continue
+                            seen_keys.add(key)
+                            results.append(r)
+                    except Exception as e:
+                        logger.warning(f"详情并发任务失败: {c.get('detail_url', '')} | 错误: {e}")
 
             logger.info(f"✓ 共从页面提取 {len(results)} 条符合条件的记录")
             return results
@@ -408,7 +389,6 @@ class PeopleSearchScraper:
                 continue
 
             location = (item.get("location", "") or "").strip() or "Unknown"
-
             candidates.append({
                 "name": "",
                 "age": age,
@@ -420,12 +400,6 @@ class PeopleSearchScraper:
 
         return candidates
 
-    def _guess_name_from_detail_url(self, detail_url: str) -> str:
-        return ""
-
-    def _get_name_from_detail_page(self, detail_url: str) -> str:
-        return ""
-
     def _get_phones_from_detail_page(self, detail_url: str, person_name: str = "") -> List[str]:
         phones = []
         detail_page = None
@@ -433,26 +407,29 @@ class PeopleSearchScraper:
         try:
             if not detail_url:
                 return []
+
             detail_page = self.context.new_page()
             logger.info(f"  ↳ 访问详情页: {detail_url}")
+
             retry_with_backoff(
                 lambda: detail_page.goto(detail_url, wait_until="domcontentloaded"),
                 label=f"detail.goto/{detail_url}"
             )
-            time.sleep(config.WAIT_TIME)
+
+            time.sleep(min(0.8, max(0.2, float(config.WAIT_TIME))))
 
             if self._is_cloudflare_challenge(detail_page):
                 logger.info("⚠️ 详情页需要 Cloudflare 验证")
                 self._handle_cloudflare_challenge(detail_page)
-                time.sleep(2)
+                time.sleep(1.0)
 
             try:
                 detail_page.wait_for_selector(
-                    "span:has-text('Wireless'), span:has-text('Mobile')",
-                    timeout=10000
+                    "span:has-text('Wireless'), span:has-text('Mobile'), a[href^='tel:']",
+                    timeout=4000
                 )
             except Exception:
-                logger.debug("详情页未命中 Wireless/Mobile 显式节点，使用回退提取")
+                logger.debug("详情页未命中显式电话节点，使用回退提取")
 
             phones = self._extract_phones_from_page(detail_page)
 
@@ -469,11 +446,8 @@ class PeopleSearchScraper:
 
     def _extract_phones_from_page(self, page) -> List[str]:
         phones: List[str] = []
-
         try:
-            phone_elements = page.query_selector_all(
-                "a[href^='tel:'], li, div, span, td, p"
-            )
+            phone_elements = page.query_selector_all("a[href^='tel:'], li, div, span, td, p")
             seen = set()
 
             for elem in phone_elements:
@@ -494,8 +468,6 @@ class PeopleSearchScraper:
                     if phone and phone not in seen:
                         seen.add(phone)
                         phones.append(phone)
-                        logger.info(f"  ✓ 找到: {phone}")
-
                 except Exception:
                     continue
 
@@ -519,16 +491,6 @@ class PeopleSearchScraper:
         except Exception as e:
             logger.debug(f"提取电话失败: {e}")
             return []
-
-    def _extract_location(self, html: str, name: str) -> str:
-        try:
-            pattern = f"{name}.*?Current Location[:=\\s]+([^<\\n]+)"
-            match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
-            if match:
-                return re.sub(r'<[^>]+>', '', match.group(1)).strip()
-        except Exception:
-            pass
-        return "Unknown"
 
     def save_results(self, results: List[Dict], filename: str):
         if not results:
@@ -571,8 +533,6 @@ class PeopleSearchScraper:
                 writer.writeheader()
                 writer.writerows(all_records)
 
-            logger.info(
-                f"✓ 新增 {len(new_records)} 条，总计 {len(all_records)} 条，已保存到 {filename}"
-            )
+            logger.info(f"✓ 新增 {len(new_records)} 条，总计 {len(all_records)} 条，已保存到 {filename}")
         except Exception as e:
             logger.error(f"保存失败: {e}")
