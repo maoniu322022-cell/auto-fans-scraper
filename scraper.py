@@ -36,6 +36,40 @@ def _normalize_phone(raw: str) -> str:
     return (raw or "").strip()
 
 
+def _clean_name(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _looks_like_slug(s: str) -> bool:
+    # 例如: U4gznwuzn2ejn4mto2idoxitny0yr
+    return bool(re.fullmatch(r"U[a-z0-9]{12,}", (s or "").strip()))
+
+
+def _valid_person_name(s: str) -> bool:
+    s = _clean_name(s)
+    if not s:
+        return False
+
+    low = s.lower()
+    bad_exact = {
+        "view all", "view all info", "all info", "details",
+        "approximate age", "current location"
+    }
+    if low in bad_exact:
+        return False
+
+    if re.search(r'view\s+all', s, re.IGNORECASE):
+        return False
+
+    if _looks_like_slug(s):
+        return False
+
+    # 至少包含字母，长度合理
+    return bool(re.search(r"[A-Za-z]", s)) and 2 <= len(s) <= 80
+
+
 # ─── 统一重试包装 ─────────────────────────────────────────────────────────────
 
 def retry_with_backoff(func, *, max_retries: int = None, base_delay: float = None,
@@ -379,6 +413,8 @@ class PeopleSearchScraper:
   const links = Array.from(document.querySelectorAll('a'))
     .filter(a => /view\\s+all\\s+info/i.test((a.textContent || '').trim()));
 
+  const looksLikeSlug = (txt) => /^U[a-z0-9]{12,}$/i.test((txt || '').trim());
+
   return links.map((link) => {
     let card = link.closest('article, li, section, div');
     let probe = card;
@@ -394,16 +430,19 @@ class PeopleSearchScraper:
     const cardText = card ? (card.innerText || '') : '';
     const ageMatch = cardText.match(/Approximate\\s+Age[:=\\s]*(\\d+)/i);
     const locationMatch = cardText.match(/Current\\s+Location[:=\\s]*([^\\n]+)/i);
-    const nameNodes = card
-      ? Array.from(card.querySelectorAll('h1, h2, h3, h4, [data-testid*="name"], a[href*="/person/"]'))
+
+    // 只取“标题类节点”，不再从 /person/ 链接直接取，避免拿到 slug
+    const titleNodes = card
+      ? Array.from(card.querySelectorAll('h1, h2, h3, h4, [data-testid*="name"], .name, .person-name'))
       : [];
 
     let name = '';
-    for (const node of nameNodes) {
+    for (const node of titleNodes) {
       const txt = (node.textContent || '').trim();
       if (!txt) continue;
       if (/view\\s+all\\s+info/i.test(txt)) continue;
       if (/approximate\\s+age|current\\s+location/i.test(txt)) continue;
+      if (looksLikeSlug(txt)) continue;
       name = txt;
       break;
     }
@@ -436,9 +475,10 @@ class PeopleSearchScraper:
             if detail_url in seen_urls:
                 continue
 
-            person_name = (item.get("name", "") or "").strip()
-            if not person_name or re.search(r'view\s+all', person_name, re.IGNORECASE):
-                person_name = self._guess_name_from_detail_url(detail_url) or search_name
+            person_name = _clean_name(item.get("name", "") or "")
+            if not _valid_person_name(person_name):
+                # 列表页拿不到有效姓名时，不再用 slug 猜名，避免 Uxxxx 进入结果
+                person_name = _clean_name(search_name) or "Unknown"
 
             location = (item.get("location", "") or "").strip() or "Unknown"
 
@@ -468,8 +508,35 @@ class PeopleSearchScraper:
         except Exception:
             return ""
 
+    def _extract_name_from_detail_page(self, page) -> str:
+        """从详情页兜底提取姓名（避免列表页取到 slug）"""
+        try:
+            selectors = ["h1", "h2", ".person-name", ".profile-name", ".name"]
+            for sel in selectors:
+                try:
+                    el = page.query_selector(sel)
+                    if not el:
+                        continue
+                    txt = _clean_name(el.inner_text() or "")
+                    if _valid_person_name(txt):
+                        return txt
+                except Exception:
+                    continue
+
+            # 回退 title
+            try:
+                title = _clean_name(page.title() or "")
+                title = re.sub(r"\s*[-|–].*$", "", title).strip()
+                if _valid_person_name(title):
+                    return title
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return ""
+
     def _get_phones_from_detail_page(self, detail_url: str, person_name: str = "") -> List[str]:
-        """访问详情页获取电话"""
+        """访问详情页获取电话，并在必要时修复姓名"""
         phones = []
         detail_page = None
 
@@ -488,6 +555,12 @@ class PeopleSearchScraper:
                 logger.info("⚠️ 详情页需要 Cloudflare 验证")
                 self._handle_cloudflare_challenge(detail_page)
                 time.sleep(2)
+
+            # 姓名兜底修复（仅日志可见，不改变函数签名）
+            fixed_name = self._extract_name_from_detail_page(detail_page)
+            if fixed_name and _valid_person_name(fixed_name):
+                if not _valid_person_name(person_name) or person_name != fixed_name:
+                    logger.info(f"  ✓ 详情页识别姓名: {fixed_name}")
 
             try:
                 detail_page.wait_for_selector(
