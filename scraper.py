@@ -170,7 +170,6 @@ class PeopleSearchScraper:
             logger.warning("⚠️ CF_MODE=skip，跳过此记录")
             return False
 
-        # manual / retry: 先等待自动通过
         logger.info("正在等待 Cloudflare 自动处理 (30秒)...")
         try:
             page.wait_for_navigation(timeout=30000, wait_until="networkidle")
@@ -179,7 +178,6 @@ class PeopleSearchScraper:
         except Exception:
             pass
 
-        # 尝试点击验证复选框
         logger.info("尝试点击验证框...")
         selectors = [
             'input[type="checkbox"]',
@@ -204,7 +202,6 @@ class PeopleSearchScraper:
             except Exception:
                 pass
 
-        # 等待验证完成（有限时间）
         wait_sec = 15
         logger.info(f"⏳ 等待验证完成 ({wait_sec}秒)...")
         time.sleep(wait_sec)
@@ -227,7 +224,6 @@ class PeopleSearchScraper:
             logger.info(f"正在搜索: {name}")
             logger.info(f"访问 URL: {search_url}")
 
-            # 优先使用 cloudscraper（带重试）
             if self.scraper:
                 logger.info("使用 cloudscraper 请求...")
                 try:
@@ -243,12 +239,10 @@ class PeopleSearchScraper:
                 except Exception:
                     logger.info("cloudscraper 全部重试失败，降级到 Playwright")
 
-            # 降级到浏览器（带重试）
             logger.info("使用 Playwright 请求...")
             if not self.page:
                 self.init_browser()
 
-            # 访问页面（带重试）
             try:
                 retry_with_backoff(
                     lambda: self.page.goto(search_url, wait_until="domcontentloaded"),
@@ -260,14 +254,12 @@ class PeopleSearchScraper:
 
             time.sleep(2)
 
-            # 处理 Cloudflare 挑战
             if self._is_cloudflare_challenge(self.page):
                 cf_ok = self._handle_cloudflare_challenge(self.page)
                 if not cf_ok and config.CF_MODE == "skip":
                     return []
                 time.sleep(2)
 
-            # 等待搜索结果加载
             try:
                 self.page.wait_for_selector(
                     'div:has-text("Approximate Age"), div:has-text("Current Location")',
@@ -277,10 +269,7 @@ class PeopleSearchScraper:
                 logger.debug("未找到结果选择器，继续处理...")
 
             time.sleep(config.WAIT_TIME)
-
-            # 从 DOM 提取结果
             results = self._extract_results_from_dom(name)
-
             return results
 
         except Exception as e:
@@ -288,7 +277,6 @@ class PeopleSearchScraper:
             return []
 
     def _fetch_with_cloudscraper(self, url: str) -> Optional[str]:
-        """使用 cloudscraper 获取页面（失败时抛出异常供 retry 捕获）"""
         response = self.scraper.get(url, timeout=30)
         if response.status_code == 200:
             logger.info(f"✓ 请求成功 (状态码: {response.status_code})")
@@ -296,22 +284,20 @@ class PeopleSearchScraper:
         raise RuntimeError(f"HTTP {response.status_code}")
 
     def _extract_results_from_html(self, html: str, search_name: str) -> List[Dict]:
-        """从 HTML 提取结果"""
         results = []
-
         if not self._has_search_results(html):
             return []
 
         pattern = r'([A-Z][a-z]+ [A-Z][a-z]+).*?Approximate Age[:=\s]+(\d+)'
         matches = re.findall(pattern, html, re.IGNORECASE)
 
-        for name, age_str in matches:
+        for _, age_str in matches:
             try:
                 age = int(age_str)
                 if config.MIN_AGE <= age <= config.MAX_AGE:
-                    location = self._extract_location(html, name)
+                    location = "Unknown"
                     results.append({
-                        "name": name.strip(),
+                        "name": "",
                         "age": age,
                         "location": location,
                         "phone": "待获取"
@@ -322,7 +308,6 @@ class PeopleSearchScraper:
         return results
 
     def _extract_results_from_dom(self, search_name: str) -> List[Dict]:
-        """从 DOM 提取结果"""
         results = []
 
         try:
@@ -332,25 +317,20 @@ class PeopleSearchScraper:
 
             seen_keys: set = set()
             for candidate in candidates:
-                person_name = candidate["name"]
+                person_name = ""   # 姓名固定为空
                 age = candidate["age"]
                 location = candidate["location"]
                 detail_url = candidate.get("detail_url", "")
 
-                # 强制从详情页纠正姓名，避免 View All Info / Uxxxx slug
-                fixed_name = self._get_name_from_detail_page(detail_url)
-                if fixed_name:
-                    person_name = fixed_name
-
                 phones = self._get_phones_from_detail_page(detail_url, person_name)
-                logger.info(f"详情提取: {person_name} | 电话数量: {len(phones)}")
+                logger.info(f"详情提取: [name-disabled] | 电话数量: {len(phones)}")
 
                 if not phones:
                     phones = ["未获取"]
 
                 for phone in phones:
                     result = {
-                        "name": person_name,
+                        "name": "",
                         "age": age,
                         "location": location,
                         "phone": phone
@@ -361,7 +341,7 @@ class PeopleSearchScraper:
                     seen_keys.add(key)
                     results.append(result)
                     logger.info(
-                        f"✓ 保存: {person_name} | 年龄: {age} | 位置: {location} | 电话: {phone}"
+                        f"✓ 保存: [name-disabled] | 年龄: {age} | 位置: {location} | 电话: {phone}"
                     )
 
             logger.info(f"✓ 共从页面提取 {len(results)} 条符合条件的记录")
@@ -374,7 +354,6 @@ class PeopleSearchScraper:
             return []
 
     def _extract_candidates_from_dom(self, search_name: str) -> List[Dict]:
-        """从列表页提取候选人员（含详情链接）"""
         candidates: List[Dict] = []
         seen_urls: set = set()
 
@@ -399,22 +378,9 @@ class PeopleSearchScraper:
     const cardText = card ? (card.innerText || '') : '';
     const ageMatch = cardText.match(/Approximate\\s+Age[:=\\s]*(\\d+)/i);
     const locationMatch = cardText.match(/Current\\s+Location[:=\\s]*([^\\n]+)/i);
-    const nameNodes = card
-      ? Array.from(card.querySelectorAll('h1, h2, h3, h4, [data-testid*="name"], a[href*="/person/"]'))
-      : [];
-
-    let name = '';
-    for (const node of nameNodes) {
-      const txt = (node.textContent || '').trim();
-      if (!txt) continue;
-      if (/view\\s+all\\s+info/i.test(txt)) continue;
-      if (/approximate\\s+age|current\\s+location/i.test(txt)) continue;
-      name = txt;
-      break;
-    }
 
     return {
-      name,
+      name: '',
       age: ageMatch ? ageMatch[1] : '',
       location: locationMatch ? locationMatch[1].trim() : '',
       detail_url: link.href || ''
@@ -441,19 +407,10 @@ class PeopleSearchScraper:
             if detail_url in seen_urls:
                 continue
 
-            person_name = (item.get("name", "") or "").strip()
-            # 列表页姓名无效时，用搜索名占位，后续会被详情页强制覆盖
-            if (
-                not person_name
-                or re.search(r'view\s+all', person_name, re.IGNORECASE)
-                or re.fullmatch(r"U[a-z0-9]{12,}", person_name or "")
-            ):
-                person_name = search_name or "Unknown"
-
             location = (item.get("location", "") or "").strip() or "Unknown"
 
             candidates.append({
-                "name": person_name,
+                "name": "",
                 "age": age,
                 "location": location,
                 "detail_url": detail_url
@@ -464,78 +421,12 @@ class PeopleSearchScraper:
         return candidates
 
     def _guess_name_from_detail_url(self, detail_url: str) -> str:
-        """从详情页 URL 猜测姓名"""
-        if not detail_url:
-            return ""
-        try:
-            path = urlparse(detail_url).path.strip("/")
-            slug = path.split("/")[-1]
-            if not slug:
-                return ""
-            slug = re.sub(r'-\d+$', '', slug)
-            words = [w for w in slug.split("-") if w and w.lower() not in {"person"}]
-            return " ".join(w.capitalize() for w in words)
-        except Exception:
-            return ""
+        return ""
 
     def _get_name_from_detail_page(self, detail_url: str) -> str:
-        """访问详情页提取姓名（强制用于覆盖列表页错误姓名）"""
-        detail_page = None
-        try:
-            if not detail_url:
-                return ""
-
-            detail_page = self.context.new_page()
-            retry_with_backoff(
-                lambda: detail_page.goto(detail_url, wait_until="domcontentloaded"),
-                label=f"name.detail.goto/{detail_url}"
-            )
-            time.sleep(max(1, config.WAIT_TIME))
-
-            if self._is_cloudflare_challenge(detail_page):
-                self._handle_cloudflare_challenge(detail_page)
-                time.sleep(2)
-
-            for sel in ["h1", "h2", ".person-name", ".profile-name", ".name"]:
-                try:
-                    el = detail_page.query_selector(sel)
-                    if el:
-                        txt = (el.inner_text() or "").strip()
-                        txt = re.sub(r"\s+", " ", txt)
-                        if (
-                            txt
-                            and not re.search(r'view\s+all', txt, re.IGNORECASE)
-                            and not re.fullmatch(r"U[a-z0-9]{12,}", txt)
-                        ):
-                            return txt
-                except Exception:
-                    pass
-
-            try:
-                t = (detail_page.title() or "").strip()
-                t = re.sub(r"\s*[-|–].*$", "", t).strip()
-                t = re.sub(r"\s+", " ", t)
-                if (
-                    t
-                    and not re.search(r'view\s+all', t, re.IGNORECASE)
-                    and not re.fullmatch(r"U[a-z0-9]{12,}", t)
-                ):
-                    return t
-            except Exception:
-                pass
-
-            return ""
-        except Exception:
-            return ""
-        finally:
-            try:
-                if detail_page:
-                    detail_page.close()
-            except Exception:
-                pass
+        return ""
 
     def _get_phones_from_detail_page(self, detail_url: str, person_name: str = "") -> List[str]:
-        """访问详情页获取电话"""
         phones = []
         detail_page = None
 
@@ -543,10 +434,10 @@ class PeopleSearchScraper:
             if not detail_url:
                 return []
             detail_page = self.context.new_page()
-            logger.info(f"  ↳ 访问详情页: {person_name or detail_url}")
+            logger.info(f"  ↳ 访问详情页: {detail_url}")
             retry_with_backoff(
                 lambda: detail_page.goto(detail_url, wait_until="domcontentloaded"),
-                label=f"detail.goto/{person_name or detail_url}"
+                label=f"detail.goto/{detail_url}"
             )
             time.sleep(config.WAIT_TIME)
 
@@ -566,7 +457,7 @@ class PeopleSearchScraper:
             phones = self._extract_phones_from_page(detail_page)
 
         except Exception as e:
-            logger.warning(f"详情页提取失败: {person_name or detail_url} | 错误: {e}")
+            logger.warning(f"详情页提取失败: {detail_url} | 错误: {e}")
         finally:
             try:
                 if detail_page:
@@ -577,7 +468,6 @@ class PeopleSearchScraper:
         return phones
 
     def _extract_phones_from_page(self, page) -> List[str]:
-        """从页面提取电话号码"""
         phones: List[str] = []
 
         try:
@@ -609,7 +499,6 @@ class PeopleSearchScraper:
                 except Exception:
                     continue
 
-            # 回退：全文正则（避免节点结构变化时全部漏掉）
             if not phones:
                 full_text = page.evaluate("document.body.innerText || ''")
                 for line in full_text.splitlines():
@@ -632,7 +521,6 @@ class PeopleSearchScraper:
             return []
 
     def _extract_location(self, html: str, name: str) -> str:
-        """提取位置"""
         try:
             pattern = f"{name}.*?Current Location[:=\\s]+([^<\\n]+)"
             match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
@@ -643,15 +531,6 @@ class PeopleSearchScraper:
         return "Unknown"
 
     def save_results(self, results: List[Dict], filename: str):
-        """
-        增量写入 CSV，并对全局结果去重。
-
-        去重键：(name, age, location, phone)
-        策略：
-          1. 若文件已存在，读取已有记录提取去重键集合。
-          2. 合并新旧记录，仅追加尚未出现的新记录。
-          3. 以安全的读-去重-写回方式更新文件（覆盖写，但内容已去重合并）。
-        """
         if not results:
             logger.warning("无结果保存")
             return
@@ -664,7 +543,6 @@ class PeopleSearchScraper:
             existing_records: List[Dict] = []
             existing_keys: set = set()
 
-            # 读取已有记录
             if output_path.exists():
                 try:
                     with open(output_path, 'r', newline='', encoding='utf-8') as f:
@@ -676,7 +554,6 @@ class PeopleSearchScraper:
                 except Exception as e:
                     logger.warning(f"读取已有文件失败，将覆盖写入: {e}")
 
-            # 筛选新增（未重复）记录
             new_records = []
             for r in results:
                 key = _dedup_key(r)
@@ -688,7 +565,6 @@ class PeopleSearchScraper:
                 logger.info(f"全部 {len(results)} 条记录已存在，无需写入")
                 return
 
-            # 合并写回
             all_records = existing_records + new_records
             with open(output_path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
