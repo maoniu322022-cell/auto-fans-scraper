@@ -44,6 +44,9 @@ class PeopleSearchScraper:
     # Browser lifecycle
     # -----------------------
     def start(self):
+        if self._pw and self.context and self.page and not self.page.is_closed():
+            return
+
         self._pw = sync_playwright().start()
         self.browser = self._pw.chromium.launch(headless=getattr(config, "HEADLESS", False))
         self.context = self.browser.new_context(
@@ -58,18 +61,59 @@ class PeopleSearchScraper:
         self.page = self.context.new_page()
         logger.info("browser started")
 
+    def _ensure_page(self):
+        if not self._pw or not self.context or not self.page or self.page.is_closed():
+            self.start()
+        self._cleanup_extra_pages()
+
+    def _cleanup_extra_pages(self):
+        if not self.context:
+            return
+        try:
+            pages = self.context.pages
+            # keep self.page only; close others to prevent about:blank accumulation
+            for p in list(pages):
+                if p is not self.page:
+                    try:
+                        p.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     def close(self):
         try:
-            if self.page:
-                self.page.close()
+            if self.context:
+                for p in list(self.context.pages):
+                    try:
+                        p.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
             if self.context:
                 self.context.close()
+        except Exception:
+            pass
+
+        try:
             if self.browser:
                 self.browser.close()
+        except Exception:
+            pass
+
+        try:
             if self._pw:
                 self._pw.stop()
         except Exception:
             pass
+
+        self.browser = None
+        self.context = None
+        self.page = None
+        self._pw = None
         logger.info("browser closed")
 
     # -----------------------
@@ -128,12 +172,12 @@ class PeopleSearchScraper:
     # Browser path: playwright
     # -----------------------
     def _fetch_with_playwright(self, full_name: str, url: str) -> List[Dict]:
-        if not self.page:
-            self.start()
+        self._ensure_page()
 
         # Robust goto with retry
         ok = self._goto_with_retry(self.page, url, f"list/{full_name}")
         if not ok:
+            self._cleanup_extra_pages()
             return []
 
         # If blocked by Cloudflare or 1015, handle it
@@ -141,6 +185,7 @@ class PeopleSearchScraper:
             logger.info("cloudflare/1015 detected")
             if not self._handle_blocking_challenge(self.page, f"list/{full_name}"):
                 logger.warning("blocking page unresolved, skip this record")
+                self._cleanup_extra_pages()
                 return []
 
         # parse first page + pagination
@@ -190,6 +235,7 @@ class PeopleSearchScraper:
         if self.only_wireless:
             filtered = [x for x in filtered if self._looks_wireless(x.get("phone", ""))]
 
+        self._cleanup_extra_pages()
         logger.info(f"[✓] matched {len(filtered)} result(s)")
         return filtered
 

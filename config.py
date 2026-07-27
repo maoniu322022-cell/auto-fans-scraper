@@ -11,7 +11,7 @@ LOG_FILE = str(BASE_DIR / "run.log")
 BASE_URL = "https://www.peoplesearchnow.com"
 SEARCH_URL = f"{BASE_URL}/person"
 
-HEADLESS = False
+HEADLESS = True
 TIMEOUT = 30000
 WAIT_TIME = 1.5
 MAX_RETRIES = 1
