@@ -1,32 +1,35 @@
-# config.py
-LOG_FILE = "logs/app.log"
-LOG_LEVEL = "INFO"
+# -*- coding: utf-8 -*-
+from pathlib import Path
 
-INPUT_FILE = "data/names.txt"
-OUTPUT_CSV = "data/results.csv"
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+
+INPUT_FILE = str(DATA_DIR / "names.txt")
+OUTPUT_FILE = str(DATA_DIR / "results.csv")
+LOG_FILE = str(BASE_DIR / "run.log")
 
 BASE_URL = "https://www.peoplesearchnow.com"
 SEARCH_URL = f"{BASE_URL}/person"
 
 HEADLESS = False
-TIMEOUT = 60000
-WAIT_TIME = 1.0
-
-MAX_RETRIES = 2
+TIMEOUT = 30000
+WAIT_TIME = 1.5
+MAX_RETRIES = 1
 RETRY_BASE_DELAY = 1.2
+
+CF_MODE = "skip"
+CF_MANUAL_MAX_WAIT = 20
 
 MIN_AGE = 55
 MAX_AGE = 75
 ONLY_WIRELESS = False
 
-# Cloudflare: skip / manual / retry
-CF_MODE = "manual"
+MAX_CANDIDATES_PER_QUERY = 20
+MAX_PAGES = 1
 
-# manual 模式下，最长等待人工验证秒数（20分钟）
-CF_MANUAL_MAX_WAIT = 1200
+USE_PERSISTENT_PROFILE = False
+CHROME_USER_DATA_DIR = r"C:\Users\maoni\AppData\Local\Google\Chrome\User Data"
+CHROME_PROFILE_DIRECTORY = "Profile 1"
+CHROME_CHANNEL = "chrome"
 
-DETAIL_CONCURRENCY = 1
-MAX_CANDIDATES_PER_QUERY = 30
-
-# 0 = 一直翻到最后一页
-MAX_PAGES = 0
+LOG_LEVEL = "INFO"

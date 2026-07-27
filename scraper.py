@@ -38,6 +38,7 @@ class PeopleSearchScraper:
         self.browser = None
         self.context = None
         self.page = None
+        self._pw = None
 
     # -----------------------
     # Browser lifecycle
@@ -65,7 +66,7 @@ class PeopleSearchScraper:
                 self.context.close()
             if self.browser:
                 self.browser.close()
-            if hasattr(self, "_pw"):
+            if self._pw:
                 self._pw.stop()
         except Exception:
             pass
@@ -181,15 +182,8 @@ class PeopleSearchScraper:
         if self.max_candidates and len(all_candidates) > self.max_candidates:
             all_candidates = all_candidates[: self.max_candidates]
 
-        # fetch detail phones (serial)
-        enriched = []
-        for c in all_candidates:
-            detail_url = c.get("detail_url")
-            if detail_url:
-                phone = self._extract_phone_from_detail(detail_url, full_name)
-                if phone:
-                    c["phone"] = phone
-            enriched.append(c)
+        # 低风控模式：不抓详情页电话（最容易触发风控）
+        enriched = all_candidates
 
         # filter by age/phone type if needed
         filtered = [x for x in enriched if self._age_ok(x.get("age"))]
@@ -366,35 +360,6 @@ class PeopleSearchScraper:
 
         return out[: self.max_candidates]
 
-    def _extract_phone_from_detail(self, detail_url: str, full_name: str) -> str:
-        p = self.context.new_page()
-        try:
-            ok = self._goto_with_retry(p, detail_url, f"detail/{full_name}")
-            if not ok:
-                return ""
-
-            if self._is_cloudflare_challenge(p) or self._is_rate_limited_1015(p):
-                logger.info("cloudflare/1015 detected on detail page")
-                if not self._handle_blocking_challenge(p, f"detail/{full_name}"):
-                    return ""
-
-            text = ""
-            try:
-                text = p.inner_text("body", timeout=5000)
-            except Exception:
-                try:
-                    text = p.content()
-                except Exception:
-                    text = ""
-
-            phones = self._find_phones(text)
-            return phones[0] if phones else ""
-        finally:
-            try:
-                p.close()
-            except Exception:
-                pass
-
     # -----------------------
     # Helpers
     # -----------------------
@@ -473,31 +438,6 @@ class PeopleSearchScraper:
             return ""
         m = re.search(r"\b([A-Z][a-z]+,\s*[A-Z]{2})\b", text)
         return m.group(1) if m else ""
-
-    def _find_phones(self, text: str) -> List[str]:
-        if not text:
-            return []
-        pats = [
-            r"\+1[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{4}",
-            r"\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{4}",
-        ]
-        seen = set()
-        out = []
-        for p in pats:
-            for m in re.findall(p, text):
-                n = self._norm_phone(m)
-                if n and n not in seen:
-                    seen.add(n)
-                    out.append(n)
-        return out
-
-    def _norm_phone(self, p: str) -> str:
-        d = re.sub(r"\D", "", p or "")
-        if len(d) == 11 and d.startswith("1"):
-            d = d[1:]
-        if len(d) != 10:
-            return ""
-        return f"({d[0:3]}) {d[3:6]}-{d[6:10]}"
 
     def _age_ok(self, age: Optional[int]) -> bool:
         if age is None:
