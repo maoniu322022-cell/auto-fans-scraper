@@ -1,5 +1,6 @@
-import logging
+﻿import logging
 import time
+import random
 from pathlib import Path
 
 import config
@@ -7,15 +8,41 @@ from scraper import PeopleSearchScraper
 
 
 def setup_logging():
+    """
+    精简日志输出：
+    - 终端只显示 __main__ 的进度信息
+    - scraper 的细节日志（如 [SAVE] / [SLOW]）不在终端显示
+    - 全量日志仍写入文件，便于排错
+    """
     Path("logs").mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(config.LOG_FILE, encoding="utf-8"),
-            logging.StreamHandler()
-        ],
-    )
+
+    log_level = getattr(logging, str(getattr(config, "LOG_LEVEL", "INFO")).upper(), logging.INFO)
+    log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+    root = logging.getLogger()
+    root.setLevel(log_level)
+
+    # 清空旧 handler，避免重复打印
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    # 文件日志：保留全部
+    file_handler = logging.FileHandler(config.LOG_FILE, encoding="utf-8")
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(logging.Formatter(log_format))
+    root.addHandler(file_handler)
+
+    # 终端日志：仅显示 __main__（进度）
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(logging.Formatter(log_format))
+
+    class MainOnlyFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return record.name == "__main__"
+
+    console_handler.addFilter(MainOnlyFilter())
+    root.addHandler(console_handler)
 
 
 def load_names(input_file: str):
@@ -50,6 +77,10 @@ def main():
     failed = 0
     all_results = []
 
+    # 仅保留“每个名字后”节流
+    per_name_min = 8
+    per_name_max = 15
+
     try:
         for i, name in enumerate(names, 1):
             logger.info("")
@@ -58,14 +89,13 @@ def main():
             try:
                 results = scraper.search_by_name(name)
 
+                # scraper 内部已“抓到即保存到 results/phones.csv”
                 if results:
-                    logger.info(f"[✓] 找到 {len(results)} 条记录")
+                    logger.info(f"[✓] 本轮新增号码: {len(results)}")
                     all_results.extend(results)
-
-                    # 关键：每个名字处理完立即增量保存
-                    scraper.save_results(results, config.OUTPUT_CSV)
+                    scraper.save_results(results, getattr(config, "OUTPUT_CSV", "results.csv"))
                 else:
-                    logger.info("[✗] 无符合条件的结果")
+                    logger.info("[✗] 本轮无新增号码")
 
                 success += 1
 
@@ -75,6 +105,11 @@ def main():
             except Exception as e:
                 failed += 1
                 logger.error(f"[✗] 处理失败: {name} | 错误: {e}")
+
+            finally:
+                sleep_s = random.uniform(per_name_min, per_name_max)
+                logger.info(f"节流等待 {sleep_s:.1f}s ...")
+                time.sleep(sleep_s)
 
     except KeyboardInterrupt:
         logger.warning("用户中断运行（Ctrl+C）")
@@ -88,17 +123,13 @@ def main():
     elapsed = time.time() - start_time
 
     logger.info("=" * 60)
-    if all_results:
-        logger.info(f"共找到 {len(all_results)} 条符合条件的记录")
-    else:
-        logger.info("未找到符合条件的结果")
-    logger.info("=" * 60)
     logger.info("── 运行摘要 ──────────────────────────────────")
     logger.info(f"  总名字数 : {len(names)}")
     logger.info(f"  成功处理 : {success}")
     logger.info(f"  失败数   : {failed}")
-    logger.info(f"  结果记录 : {len(all_results)}")
+    logger.info(f"  新增号码 : {len(all_results)}")
     logger.info(f"  总耗时   : {elapsed:.1f}s")
+    logger.info("  实时文件 : results/phones.csv")
     logger.info("=" * 60)
 
 
