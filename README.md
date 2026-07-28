@@ -1,117 +1,95 @@
-# Auto Fans Scraper
+# auto-fans-scraper
 
-自动化人物信息搜索系统，从 [PeopleSearchNow](https://www.peoplesearchnow.com) 按姓名批量抓取目标年龄段人员信息（姓名、年龄、位置、Wireless 电话）。
+用于批量处理姓名输入并执行自动化采集流程的 Python + Playwright 工具。
 
-## 功能
+## 功能简介
 
-- 按姓名从 PeopleSearchNow 搜索人物
-- 自动过滤指定年龄范围内的用户（默认 53–75 岁）
-- 提取 Wireless / Mobile 电话号码
-- 支持批量处理多个姓名
-- cloudscraper 优先 + Playwright 降级双路径抓取
-- 可配置的 Cloudflare 处理策略（skip / manual / retry）
-- 统一指数退避重试，重试次数与延迟均可配置
-- 增量写入 + 全局去重，多次运行不重复膨胀数据
-- 运行结束后输出摘要统计（总数 / 成功 / 失败 / 结果数 / 耗时）
+- 从 `data/names.txt` 读取姓名（每行一个）。
+- 按配置执行自动化浏览流程并采集结果。
+- 输出 CSV 结果文件，支持失败重试队列。
+- 记录运行日志，便于排查问题。
 
-## 安装
+## 运行环境
 
-```bash
+- Windows（已提供一键脚本）
+- Python 3.10+
+- Google Chrome（或 Playwright 支持的浏览器）
+
+## 安装与启动
+
+### 方式一：Windows 一键初始化（推荐）
+
+```powershell
 git clone https://github.com/maoniu322022-cell/auto-fans-scraper.git
 cd auto-fans-scraper
+powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1
+python -u .\main.py
+```
+
+### 方式二：手动安装
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -U pip
 pip install -r requirements.txt
-# 安装 Playwright 浏览器（首次必须执行）
-python -m playwright install chromium
+playwright install
 ```
 
-## 配置（.env）
+创建 `.env`（可从 `.env.example` 复制）后运行：
 
-复制示例文件并按需编辑：
-
-```bash
-cp .env.example .env
+```powershell
+python -u .\main.py
 ```
 
-`.env` 文件中的所有参数均为可选，缺失时使用 `config.py` 中的默认值：
+## 输入与输出
 
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `MIN_AGE` | `53` | 年龄下限 |
-| `MAX_AGE` | `75` | 年龄上限 |
-| `ONLY_WIRELESS` | `true` | 仅保留 Wireless 电话 |
-| `HEADLESS` | `false` | 无头模式（服务器端设为 `true`） |
-| `TIMEOUT` | `30000` | 页面加载超时（毫秒） |
-| `WAIT_TIME` | `2` | 页面就绪后额外等待（秒） |
-| `MAX_RETRIES` | `3` | 网络/页面动作最大重试次数 |
-| `RETRY_BASE_DELAY` | `1.0` | 指数退避起始延迟（秒） |
-| `CF_MODE` | `skip` | Cloudflare 策略：`skip` \| `manual` \| `retry` |
-| `LOG_LEVEL` | `INFO` | 日志级别：`DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
-| `LOG_FILE` | `logs/app.log` | 日志文件路径 |
-| `INPUT_FILE` | `data/names.txt` | 输入姓名列表文件 |
-| `OUTPUT_FILE` | `data/results.csv` | 输出 CSV 文件路径 |
+### 输入文件
 
-### CF_MODE 说明
+- `data/names.txt`：待处理姓名列表（每行一个姓名）
 
-| 值 | 行为 |
-|---|---|
-| `skip`（默认） | 遇到 Cloudflare 直接跳过该条记录，适合无人值守批处理 |
-| `manual` | 等待最多 45 秒让浏览器自动通过，超时后继续（不阻塞 STDIN） |
-| `retry` | 与 `manual` 等待相同，重试由外层 `MAX_RETRIES` 控制 |
+### 输出文件（默认）
 
-## 使用
+- `data/results.csv`：采集结果
+- `failed_queue.csv`：失败任务队列
+- `run.log` 或 `logs/` 下日志文件：运行日志
 
-1. 将待搜索姓名每行一个写入 `data/names.txt`：
+> 说明：具体输出路径以 `config.py` / `.env` 配置为准，请保持两者一致。
 
-   ```
-   John Smith
-   Jane Doe
-   ```
+## 项目结构（核心）
 
-2. 运行：
-
-   ```bash
-   python main.py
-   ```
-
-3. 结果保存在 `data/results.csv`，日志在 `logs/app.log`。
-4. 电话号码会在列表页筛选后进入 **详情页** 提取（优先匹配 Wireless / Mobile），因此相比仅解析列表页会稍慢。
-
-## 项目结构
-
-```
+```text
 auto-fans-scraper/
-├── README.md
-├── requirements.txt
-├── .env.example            # 环境变量示例（复制为 .env 使用）
-├── main.py                 # 主程序入口
-├── config.py               # 配置管理（读取 .env + 默认值）
-├── scraper.py              # 爬虫核心
-├── data/
-│   ├── names.txt           # 输入姓名列表
-│   └── results.csv         # 输出结果（增量去重写入）
-└── logs/
-    └── app.log             # 应用日志
+├─ main.py
+├─ scraper.py
+├─ config.py
+├─ requirements.txt
+├─ .env.example
+├─ README.md
+├─ README-DEPLOY.md
+├─ setup_windows.ps1
+└─ data/
+   └─ names.txt
 ```
 
-## 常见故障排查
+## 常见问题
 
-### Cloudflare 验证失败
-- 默认 `CF_MODE=skip` 会跳过遇到 Cloudflare 的记录；若需要尝试自动通过，改为 `CF_MODE=manual`。
-- 在有头模式（`HEADLESS=false`）下运行，观察浏览器行为有助于排查。
+### 1) 新电脑运行失败（依赖/浏览器问题）
 
-### 超时 / 无结果
-- 适当增大 `TIMEOUT`（如 `60000`）和 `WAIT_TIME`（如 `5`）。
-- 增大 `MAX_RETRIES`（如 `5`）减少偶发网络失败的影响。
+```powershell
+pip install -r requirements.txt
+playwright install
+```
 
-### 浏览器未安装
-- 首次使用必须执行 `python -m playwright install chromium`。
+### 2) Chrome 路径问题
 
-### 结果 CSV 中出现 "待获取" / "未获取"
-- cloudscraper 路径仅解析 HTML 文本，电话字段可能无法获取；Playwright 路径会尝试从页面 DOM 提取。
-- Playwright 路径会继续访问每条结果的详情页提取电话；若详情页无号码、受风控或访问失败，字段会保留为 `未获取`。
-- 两条路径均未能获取时，字段填 `待获取` / `未获取`。
+如本机 Chrome 安装路径与代码默认值不同，请在 `scraper.py` 或配置中调整浏览器路径。
 
-## 注意事项
+### 3) 为什么仓库里没有 `.env`、日志和结果文件？
 
-- 本工具仅用于合法的数据查询场景，请遵守目标网站的服务条款。
-- 输出文件采用**增量去重写入**策略：多次运行同一名字不会产生重复行，以 `(name, age, location, phone)` 为去重键。
+这些属于本地运行产物或敏感配置，已在 `.gitignore` 中忽略，不应上传到仓库。
+
+## 合规与免责声明
+
+本项目仅用于合法、合规且已获授权的自动化测试与数据处理场景。  
+请遵守目标网站服务条款、当地法律法规及隐私要求。使用者对其行为与后果负责。
