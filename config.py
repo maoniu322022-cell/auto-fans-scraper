@@ -3,41 +3,61 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
+RESULTS_DIR = BASE_DIR / "results"
 
 INPUT_FILE = str(DATA_DIR / "names.txt")
-OUTPUT_FILE = str(DATA_DIR / "results.csv")
+RESULTS_FILE = str(RESULTS_DIR / "phones.csv")
+OUTPUT_FILE = RESULTS_FILE  # 兼容旧代码
 LOG_FILE = str(BASE_DIR / "run.log")
 
 BASE_URL = "https://www.peoplesearchnow.com"
 SEARCH_URL = f"{BASE_URL}/person"
 
-HEADLESS = False
+# 浏览器与连接
+CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+CHROME_USER_DATA_DIR = r"C:\chrome-debug-profile"
+CDP_HOST = "127.0.0.1"
+CDP_PORT = 9222
+AUTO_START_CHROME = True
+CHROME_START_WAIT_SEC = 20
+
+# 页面等待与重试
 TIMEOUT = 30000
-WAIT_TIME = 1.0
-MAX_RETRIES = 2
-RETRY_BASE_DELAY = 1.2
+WAIT_TIME = 0.2
+MAX_RETRIES = 1
+RETRY_BASE_DELAY = 1.0
 
-# 当前 scraper.py 为“检测到验证即跳过并记录 failed_queue.csv”的模式
-CF_MODE = "skip"
-CF_MANUAL_MAX_WAIT = 1800
-
+# 抓取范围
 MIN_AGE = 55
 MAX_AGE = 75
-ONLY_WIRELESS = False
-
 MAX_CANDIDATES_PER_QUERY = 30
-MAX_PAGES = 0  # 0 = unlimited
+MAX_PAGES = 0  # 0 = 不限页数
 
-# 失败队列输出（可选，scraper.py 会读取）
-FAILED_QUEUE_PATH = str(DATA_DIR / "failed_queue.csv")
+# 速度与节流（稳中求快）
+WAIT_TIME = 0.8
 
-# 以下参数在当前“无痕 chromium”实现中不生效，保留不影响
-USE_PERSISTENT_PROFILE = False
-CHROME_USER_DATA_DIR = r"C:\Users\maoni\AppData\Local\Google\Chrome\User Data"
-CHROME_PROFILE_DIRECTORY = "Profile 1"
-CHROME_CHANNEL = "chrome"
+PAGE_COOLDOWN_MIN = 1.2
+PAGE_COOLDOWN_MAX = 2.2
 
-BROWSER_CHANNEL = "chromium"
-BROWSER_EXECUTABLE_CANDIDATES = []
+DETAIL_COOLDOWN_MIN = 2.0
+DETAIL_COOLDOWN_MAX = 3.5
+
+NAME_COOLDOWN_MIN = 4.0
+NAME_COOLDOWN_MAX = 7.0
+
+RESULT_FLUSH_SIZE = 10
+MAX_RETRIES = 2
+# 降低无关资源加载；不会阻止 JavaScript、样式或 API 请求。
+BLOCK_HEAVY_RESOURCES = True
+BLOCKED_RESOURCE_TYPES = ("image", "media", "font")
+
+# 人工验证：检测到后暂停，需在浏览器完成验证并回终端按回车。
+MANUAL_CHALLENGE_TIMEOUT = 1800
+
+# 输出。每累计 30 个新号码写入一次；正常结束或 Ctrl+C 时也会写入。
+RESULT_FLUSH_SIZE = 30
+
+# 每次启动前清空上次结果（results/phones.csv）
+CLEAR_RESULTS_ON_START = True
 
 LOG_LEVEL = "INFO"

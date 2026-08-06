@@ -45,6 +45,19 @@ def setup_logging():
     root.addHandler(console_handler)
 
 
+def clean_previous_results():
+    """
+    每次运行前清空 results/phones.csv
+    """
+    p = Path("results/phones.csv")
+    p.parent.mkdir(parents=True, exist_ok=True)  # 确保 results 目录存在
+    if p.exists():
+        p.unlink(missing_ok=True)
+        print("✅ 已清空 results/phones.csv，开始新任务。")
+    else:
+        print("ℹ️ results/phones.csv 不存在，已跳过清空。")
+
+
 def load_names(input_file: str):
     p = Path(input_file)
     if not p.exists():
@@ -134,4 +147,5 @@ def main():
 
 
 if __name__ == "__main__":
+    clean_previous_results()  # ← 只新增这一行：每次启动先清空 results/phones.csv
     main()
