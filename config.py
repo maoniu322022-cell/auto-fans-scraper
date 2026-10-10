@@ -10,7 +10,7 @@ RESULTS_FILE = str(RESULTS_DIR / "phones.csv")
 OUTPUT_FILE = RESULTS_FILE  # 兼容旧代码
 LOG_FILE = str(BASE_DIR / "run.log")
 
-BASE_URL = "https://www.peoplesearchnow.com"
+BASE_URL = "https://www.cyberbackgroundchecks.com"
 SEARCH_URL = f"{BASE_URL}/person"
 
 # 浏览器与连接
