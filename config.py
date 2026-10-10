@@ -11,7 +11,7 @@ OUTPUT_FILE = RESULTS_FILE  # 兼容旧代码
 LOG_FILE = str(BASE_DIR / "run.log")
 
 BASE_URL = "https://www.cyberbackgroundchecks.com"
-SEARCH_URL = f"{BASE_URL}/person"
+SEARCH_URL = f"{BASE_URL}/name"
 
 # 浏览器与连接
 CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
@@ -23,7 +23,7 @@ CHROME_START_WAIT_SEC = 20
 
 # 页面等待与重试
 TIMEOUT = 30000
-WAIT_TIME = 0.2
+WAIT_TIME = 2.0
 MAX_RETRIES = 1
 RETRY_BASE_DELAY = 1.0
 
@@ -34,8 +34,6 @@ MAX_CANDIDATES_PER_QUERY = 30
 MAX_PAGES = 0  # 0 = 不限页数
 
 # 速度与节流（稳中求快）
-WAIT_TIME = 0.8
-
 PAGE_COOLDOWN_MIN = 1.2
 PAGE_COOLDOWN_MAX = 2.2
 
@@ -48,7 +46,7 @@ NAME_COOLDOWN_MAX = 7.0
 RESULT_FLUSH_SIZE = 10
 MAX_RETRIES = 2
 # 降低无关资源加载；不会阻止 JavaScript、样式或 API 请求。
-BLOCK_HEAVY_RESOURCES = True
+BLOCK_HEAVY_RESOURCES = False
 BLOCKED_RESOURCE_TYPES = ("image", "media", "font")
 
 # 人工验证：检测到后暂停，需在浏览器完成验证并回终端按回车。
