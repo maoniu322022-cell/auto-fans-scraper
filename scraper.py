@@ -7,7 +7,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import quote_plus, urljoin
 
 from playwright.sync_api import (
     TimeoutError as PlaywrightTimeoutError,
@@ -21,8 +21,21 @@ class PeopleSearchScraper:
     def __init__(self, *args, **kwargs):
         self.base_url = kwargs.get(
             "base_url",
-            "https://www.peoplesearchnow.com",
+            "https://www.cyberbackgroundchecks.com",
         ).rstrip("/")
+
+        self.search_routes = tuple(
+            kwargs.get(
+                "search_routes",
+                (
+                    "/name",
+                    "/names",
+                    "/people",
+                    "/person",
+                    "/search",
+                ),
+            )
+        )
 
         self.timeout = int(kwargs.get("timeout", 30000))
         self.wait_time = float(kwargs.get("wait_time", 0.5))
@@ -451,10 +464,18 @@ class PeopleSearchScraper:
         return None
 
     def _collect_cards_current_page(self, page) -> list[dict]:
-        selector = (
-            "a:has-text('View Details'), "
-            "a:has-text('View All Info')"
-        )
+        selectors = [
+            "a[href*='detail' i]",
+            "a[href*='profile' i]",
+            "a[href*='person' i]",
+            "a[href*='people' i]",
+            "a[href*='name' i]",
+            "a:has-text('View Details')",
+            "a:has-text('View All Info')",
+            "a:has-text('Full Details')",
+            "a:has-text('More Info')",
+        ]
+        selector = ", ".join(dict.fromkeys(selectors))
 
         try:
             raw_cards = page.locator(selector).evaluate_all(
@@ -466,7 +487,7 @@ class PeopleSearchScraper:
                     while (node && node !== document.body) {
                         const text = node.innerText || "";
 
-                        if (/Approximate\\s+Age\\s*:/i.test(text)) {
+                        if (/Approximate\s+Age\s*:/i.test(text) || /\bAge\b/i.test(text) || /\b\d{2}\s*years?\s*old\b/i.test(text)) {
                             cardText = text;
                             break;
                         }
@@ -476,7 +497,7 @@ class PeopleSearchScraper:
 
                     return {
                         href: link.href || "",
-                        text: cardText
+                        text: cardText || (link.innerText || "")
                     };
                 })
                 """
@@ -491,24 +512,22 @@ class PeopleSearchScraper:
 
         for item in raw_cards:
             detail_url = (item.get("href") or "").strip()
-            age = self._extract_age(item.get("text") or "")
-
-            if not detail_url or age is None:
-                continue
-
-            if not self.min_age <= age <= self.max_age:
+            if not detail_url:
                 continue
 
             if detail_url in seen_urls:
                 continue
-
             seen_urls.add(detail_url)
-            candidates.append(
-                {
-                    "age": age,
-                    "detail_url": detail_url,
-                }
-            )
+
+            text = item.get("text") or ""
+            age = self._extract_age(text)
+            if age is not None and not self.min_age <= age <= self.max_age:
+                continue
+
+            candidates.append({
+                "age": age,
+                "detail_url": detail_url,
+            })
 
             if (
                 self.max_candidates_per_query is not None
@@ -523,11 +542,9 @@ class PeopleSearchScraper:
             candidates = page.locator(
                 ".pagination a:has-text('Next'), "
                 "[class*='pagination'] a:has-text('Next'), "
-                "nav[aria-label*='pagination' i] a:has-text('Next')"
+                "nav[aria-label*='pagination' i] a:has-text('Next'), "
+                "a:has-text('Next')"
             )
-
-            if candidates.count() == 0:
-                candidates = page.locator("a:has-text('Next')")
 
             if candidates.count() == 0:
                 return False
@@ -601,10 +618,6 @@ class PeopleSearchScraper:
         list_url: str,
         tag: str,
     ) -> bool:
-        """
-        优先使用浏览器后退回列表页，避免重新打开第一页再逐页翻回。
-        若历史记录不可用，再直接打开当前列表页 URL。
-        """
         try:
             page.go_back(
                 wait_until="domcontentloaded",
@@ -699,6 +712,84 @@ class PeopleSearchScraper:
             logger.exception("保存号码失败")
             return 0
 
+    def _candidate_search_urls(self, name: str) -> list[str]:
+        slug = self._slugify_name(name)
+        tokens = [
+            name.strip(),
+            slug,
+            slug.replace("-", " "),
+            name.strip().replace(" ", "-"),
+        ]
+        seen = set()
+        urls = []
+
+        for route in self.search_routes:
+            route_prefix = route if route.startswith("http") else f"{self.base_url}{route}"
+            route_prefix = route_prefix.rstrip("/")
+            if route_prefix not in seen:
+                seen.add(route_prefix)
+                urls.append(route_prefix)
+
+            for token in tokens:
+                if not token:
+                    continue
+                url = f"{route_prefix}/{token.strip('/')}"
+                if url not in seen:
+                    seen.add(url)
+                    urls.append(url)
+
+            for token in tokens:
+                if not token:
+                    continue
+                encoded = quote_plus(token)
+                url = f"{route_prefix}?q={encoded}"
+                if url not in seen:
+                    seen.add(url)
+                    urls.append(url)
+
+        return urls
+
+    def _try_fill_search_form(self, page, name: str) -> bool:
+        try:
+            if page.locator("form").count() == 0:
+                return False
+
+            inputs = page.locator("input, textarea, select")
+            if inputs.count() == 0:
+                return False
+
+            filled = False
+            for idx in range(min(inputs.count(), 6)):
+                locator = inputs.nth(idx)
+                field_name = (locator.get_attribute("name") or "").lower()
+                field_placeholder = (locator.get_attribute("placeholder") or "").lower()
+                field_id = (locator.get_attribute("id") or "").lower()
+                field_type = (locator.get_attribute("type") or "").lower()
+
+                if field_type in {"hidden"}:
+                    continue
+
+                if any(k in field_name for k in ("name", "search", "query")) or any(k in field_placeholder for k in ("name", "search")) or any(k in field_id for k in ("name", "search", "query")):
+                    locator.fill(name)
+                    filled = True
+                    break
+
+            if not filled:
+                inputs.first.fill(name)
+                filled = True
+
+            button = page.locator("button[type='submit'], input[type='submit'], button:has-text('Search'), button:has-text('Submit')")
+            if button.count() > 0:
+                button.first.click(timeout=self.timeout)
+                self._wait_ready(page)
+                return True
+
+            return filled
+
+        except Exception:
+            logger.debug("搜索表单填充失败", exc_info=True)
+            return False
+
     # ---------------- public API ----------------
 
     def search_by_name(self, name: str, *args, **kwargs) -> list[dict]:
@@ -710,134 +801,149 @@ class PeopleSearchScraper:
         if not slug:
             return []
 
-        initial_list_url = f"{self.base_url}/person/{slug}"
+        search_urls = self._candidate_search_urls(name)
+        last_error = None
 
-        logger.info(f"[search_by_name] {name} -> {initial_list_url}")
+        for initial_list_url in search_urls:
+            logger.info(f"[search_by_name] {name} -> {initial_list_url}")
 
-        if not self._navigate(page, initial_list_url, f"{name} list"):
-            return []
-
-        if not self._guard_challenge(
-            page,
-            tag=f"{name} list",
-            return_url=initial_list_url,
-        ):
-            return []
-
-        collected = []
-        page_number = 1
-        current_list_url = page.url
-        visited_list_urls = {current_list_url}
-
-        while True:
-            logger.info(
-                f"[{name}] 正在处理列表第 {page_number} 页"
-            )
-
-            candidates = self._collect_cards_current_page(page)
-
-            logger.info(
-                f"[{name}] 候选详情数 "
-                f"({self.min_age}-{self.max_age} 岁)："
-                f"{len(candidates)}"
-            )
-
-            if candidates:
-                self._sleep_rand(
-                    self.per_action_min,
-                    self.per_action_max,
-                    f"{name} page {page_number}",
-                )
-
-            for index, candidate in enumerate(candidates, start=1):
-                detail_url = candidate["detail_url"]
-                age = candidate["age"]
-
-                logger.info(
-                    f"[{name}] 详情 {index}/{len(candidates)}，"
-                    f"年龄 {age}"
-                )
-
-                if not self._navigate(
-                    page,
-                    detail_url,
-                    f"{name} detail {index}",
-                ):
-                    continue
-
-                if not self._guard_challenge(
-                    page,
-                    tag=f"{name} detail {index}",
-                    return_url=detail_url,
-                ):
-                    return collected
-
-                try:
-                    body_text = page.locator("body").inner_text(
-                        timeout=self.timeout
-                    )
-                except Exception:
-                    logger.warning(
-                        f"[{name}] 读取详情文本失败：{detail_url}"
-                    )
-                    body_text = ""
-
-                for phone in self._extract_phone_candidates(body_text):
-                    if self._queue_phone(phone):
-                        collected.append({"phone": phone})
-
-                if not self._return_to_list_page(
-                    page,
-                    current_list_url,
-                    f"{name} detail {index}",
-                ):
-                    logger.warning(
-                        f"[{name}] 无法返回当前列表页，"
-                        "停止该姓名。"
-                    )
-                    return collected
-
-                if index < len(candidates):
-                    self._sleep_rand(
-                        self.per_detail_min,
-                        self.per_detail_max,
-                        f"{name} detail cooldown",
-                    )
-
-            if (
-                self.max_pages is not None
-                and page_number >= self.max_pages
-            ):
-                break
-
-            self._sleep_rand(
-                self.per_action_min,
-                self.per_action_max,
-                f"{name} page transition",
-            )
-
-            if not self._advance_to_next_page(page, name):
-                break
+            if not self._navigate(page, initial_list_url, f"{name} list"):
+                last_error = RuntimeError(f"无法打开搜索入口: {initial_list_url}")
+                continue
 
             if not self._guard_challenge(
                 page,
-                tag=f"{name} next page",
+                tag=f"{name} list",
+                return_url=initial_list_url,
             ):
+                return []
+
+            try:
+                self._try_fill_search_form(page, name)
+                self._wait_ready(page)
+            except Exception:
+                pass
+
+            if self._guard_challenge(page, tag=f"{name} search"):
+                pass
+
+            current_url = page.url
+            if any(marker in current_url.lower() for marker in ("/detail/", "/profile/", "/person/", "/people/")):
+                pass
+
+            collected = []
+            page_number = 1
+            current_list_url = page.url
+            visited_list_urls = {current_list_url}
+
+            while True:
+                logger.info(
+                    f"[{name}] 正在处理列表第 {page_number} 页"
+                )
+
+                candidates = self._collect_cards_current_page(page)
+
+                logger.info(
+                    f"[{name}] 候选详情数 "
+                    f"({self.min_age}-{self.max_age} 岁)："
+                    f"{len(candidates)}"
+                )
+
+                if candidates:
+                    self._sleep_rand(
+                        self.per_action_min,
+                        self.per_action_max,
+                        f"{name} page {page_number}",
+                    )
+
+                for index, candidate in enumerate(candidates, start=1):
+                    detail_url = candidate["detail_url"]
+                    age = candidate.get("age")
+
+                    logger.info(
+                        f"[{name}] 详情 {index}/{len(candidates)}，"
+                        f"年龄 {age}"
+                    )
+
+                    if not self._navigate(
+                        page,
+                        detail_url,
+                        f"{name} detail {index}",
+                    ):
+                        continue
+
+                    if not self._guard_challenge(
+                        page,
+                        tag=f"{name} detail {index}",
+                        return_url=detail_url,
+                    ):
+                        return collected
+
+                    try:
+                        body_text = page.locator("body").inner_text(
+                            timeout=self.timeout
+                        )
+                    except Exception:
+                        logger.warning(
+                            f"[{name}] 读取详情文本失败：{detail_url}"
+                        )
+                        body_text = ""
+
+                    for phone in self._extract_phone_candidates(body_text):
+                        if self._queue_phone(phone):
+                            collected.append({"phone": phone})
+
+                    if not self._return_to_list_page(
+                        page,
+                        current_list_url,
+                        f"{name} detail {index}",
+                    ):
+                        logger.warning(
+                            f"[{name}] 无法返回当前列表页，"
+                            "停止该姓名。"
+                        )
+                        return collected
+
+                    if index < len(candidates):
+                        self._sleep_rand(
+                            self.per_detail_min,
+                            self.per_detail_max,
+                            f"{name} detail cooldown",
+                        )
+
+                if (
+                    self.max_pages is not None
+                    and page_number >= self.max_pages
+                ):
+                    break
+
+                if not self._advance_to_next_page(page, name):
+                    break
+
+                if not self._guard_challenge(
+                    page,
+                    tag=f"{name} next page",
+                ):
+                    return collected
+
+                current_list_url = page.url
+
+                if current_list_url in visited_list_urls:
+                    logger.warning(
+                        f"[{name}] 检测到分页循环，停止该姓名。"
+                    )
+                    break
+
+                visited_list_urls.add(current_list_url)
+                page_number += 1
+
+            self.flush_results()
+            if collected:
                 return collected
 
-            current_list_url = page.url
-
-            if current_list_url in visited_list_urls:
-                logger.warning(
-                    f"[{name}] 检测到分页循环，停止该姓名。"
-                )
-                break
-
-            visited_list_urls.add(current_list_url)
-            page_number += 1
-
-        self.flush_results()
-        return collected
+        if last_error:
+            logger.warning(f"[search_by_name] {last_error}")
+        return []
 
     def save_results(self, records, output_file=None) -> int:
         """兼容旧调用；新流程会自动保存。"""
