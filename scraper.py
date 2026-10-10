@@ -479,7 +479,7 @@ class PeopleSearchScraper:
 
         try:
             raw_cards = page.locator(selector).evaluate_all(
-                """
+                r"""
                 links => links.map(link => {
                     let node = link;
                     let cardText = "";
@@ -751,40 +751,104 @@ class PeopleSearchScraper:
 
     def _try_fill_search_form(self, page, name: str) -> bool:
         try:
-            if page.locator("form").count() == 0:
+            forms = page.locator("form")
+            if forms.count() == 0:
                 return False
 
-            inputs = page.locator("input, textarea, select")
-            if inputs.count() == 0:
-                return False
+            parts = [p.strip() for p in (name or "").split() if p.strip()]
+            first_name = parts[0] if len(parts) >= 2 else ""
+            last_name = parts[-1] if len(parts) >= 2 else ""
+            middle_name = " ".join(parts[1:-1]) if len(parts) > 2 else ""
 
-            filled = False
-            for idx in range(min(inputs.count(), 6)):
-                locator = inputs.nth(idx)
-                field_name = (locator.get_attribute("name") or "").lower()
-                field_placeholder = (locator.get_attribute("placeholder") or "").lower()
-                field_id = (locator.get_attribute("id") or "").lower()
-                field_type = (locator.get_attribute("type") or "").lower()
-
-                if field_type in {"hidden"}:
+            for form_idx in range(forms.count()):
+                form = forms.nth(form_idx)
+                inputs = form.locator("input, textarea, select")
+                if inputs.count() == 0:
                     continue
 
-                if any(k in field_name for k in ("name", "search", "query")) or any(k in field_placeholder for k in ("name", "search")) or any(k in field_id for k in ("name", "search", "query")):
-                    locator.fill(name)
-                    filled = True
-                    break
+                filled_any = False
+                for idx in range(inputs.count()):
+                    locator = inputs.nth(idx)
+                    field_name = (locator.get_attribute("name") or "").lower()
+                    field_placeholder = (locator.get_attribute("placeholder") or "").lower()
+                    field_id = (locator.get_attribute("id") or "").lower()
+                    field_type = (locator.get_attribute("type") or "").lower()
+                    label_text = ""
+                    try:
+                        label_text = locator.evaluate("el => { const id = el.id; const label = id ? document.querySelector(`label[for='${id}']`) : null; return label ? label.textContent : ''; }") or ""
+                    except Exception:
+                        label_text = ""
+                    label_text = (label_text or "").lower()
 
-            if not filled:
-                inputs.first.fill(name)
-                filled = True
+                    if field_type in {"hidden"}:
+                        continue
 
-            button = page.locator("button[type='submit'], input[type='submit'], button:has-text('Search'), button:has-text('Submit')")
-            if button.count() > 0:
-                button.first.click(timeout=self.timeout)
-                self._wait_ready(page)
-                return True
+                    key_tokens = [
+                        "first", "fname", "firstname",
+                        "last", "lname", "lastname",
+                        "middle", "mi",
+                        "city", "state", "location",
+                        "search", "query"
+                    ]
+                    compact = " ".join([
+                        field_name,
+                        field_placeholder,
+                        field_id,
+                        label_text,
+                    ]).lower()
 
-            return filled
+                    if any(token in compact for token in ("first", "fname", "firstname")) and first_name:
+                        locator.fill(first_name)
+                        filled_any = True
+                        continue
+
+                    if any(token in compact for token in ("middle", "mi")) and middle_name:
+                        locator.fill(middle_name)
+                        filled_any = True
+                        continue
+
+                    if any(token in compact for token in ("last", "lname", "lastname")) and last_name:
+                        locator.fill(last_name)
+                        filled_any = True
+                        continue
+
+                    if any(token in compact for token in ("city", "state", "location")):
+                        locator.fill("")
+                        filled_any = True
+                        continue
+
+                    if any(token in compact for token in ("search", "query")):
+                        locator.fill(name)
+                        filled_any = True
+                        continue
+
+                submit = form.locator("button, input[type='submit'], input[type='button'], input[type='image'], a[role='button']")
+                if submit.count() > 0:
+                    try:
+                        submit.first.click(timeout=self.timeout)
+                        self._wait_ready(page)
+                        return True
+                    except Exception:
+                        pass
+
+                if filled_any:
+                    try:
+                        form.locator("input, textarea").last.press("Enter")
+                        self._wait_ready(page)
+                        return True
+                    except Exception:
+                        pass
+
+                # fallback: fill the first text input with full name
+                if inputs.count() > 0:
+                    try:
+                        inputs.first.fill(name)
+                        self._wait_ready(page)
+                        return True
+                    except Exception:
+                        pass
+
+            return False
 
         except Exception:
             logger.debug("搜索表单填充失败", exc_info=True)
@@ -822,9 +886,6 @@ class PeopleSearchScraper:
                 self._try_fill_search_form(page, name)
                 self._wait_ready(page)
             except Exception:
-                pass
-
-            if self._guard_challenge(page, tag=f"{name} search"):
                 pass
 
             current_url = page.url
